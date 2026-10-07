@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "VarlenTransformer"
+version = "0.1.0"
+description = "BF16 transformer blocks for packed variable-length and fixed-length FlashAttention"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.8",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "build>=1.2",
+    "hatchling>=1.27",
+]
+gpu = ["flash-attn>=2.6,<3"]
+
+[tool.hatch.build]
+exclude = ["**/__pycache__", "**/*.pyc", "**/*.pyo", ".pytest_cache", ".coverage", "coverage.xml", "test-results.xml", "gpu-test-results.xml"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/varlen_transformer"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/.github", "/README.md", "/TESTING.md", "/LICENSE", "/THIRD_PARTY_NOTICES.md", "/pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = ["cuda: requires a compatible NVIDIA GPU and the real FlashAttention package"]
+
+[tool.coverage.run]
+branch = true
+source = ["varlen_transformer"]
+
+[tool.coverage.report]
+show_missing = true
