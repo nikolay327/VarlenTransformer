@@ -34,8 +34,10 @@ def unpack_fixed_memory_query(state: Tensor, layout: FixedMemoryQueryLayout) -> 
     """Convert flat stream-major state to (B,Sm+1+Sq,E), preserving gradients."""
     if not isinstance(layout, FixedMemoryQueryLayout):
         raise ValueError("fixed unpacking requires FixedMemoryQueryLayout")
-    if state.ndim != 2:
-        raise ValueError("unpacking requires a flat stream-major tensor")
+    if state.ndim != 2 or state.shape[-1] == 0:
+        raise ValueError(
+            "unpacking requires a flat stream-major tensor with nonzero width"
+        )
     layout.validate(state, state.shape[-1])
     n, b, e = layout.num_memory_tokens, layout.batch_size, state.shape[-1]
     return torch.cat(
