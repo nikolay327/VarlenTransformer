@@ -23,6 +23,10 @@ class FixedMemoryQueryLayout:
             positive_int(name, getattr(self, name))
         if self.x_prefix_length > self.memory_length:
             raise ValueError("x_prefix_length cannot exceed memory_length")
+        if self.memory_length != self.x_prefix_length + self.query_length - 1:
+            raise ValueError(
+                "NCSE layout requires memory_length = x_prefix_length + query_length - 1"
+            )
 
     @classmethod
     def ncse(cls, x_prefix_length: int, query_length: int):
@@ -53,8 +57,8 @@ class PackedMemoryQueryLayout:
     """Stream-major state: [all M samples; one V per sample; all Q samples].
 
     Build once with from_lengths(), then reuse through the stack. Direct
-    construction accepts precomputed metadata without reading its values.
-    Its offset/index contents are a caller contract, as in the existing MHA.
+    construction verifies CPU offset/index values. Device-resident values require
+    explicit trust_metadata=True; use from_lengths() for verified construction.
     """
 
     num_memory_tokens: int
@@ -66,6 +70,8 @@ class PackedMemoryQueryLayout:
     max_seqlen_q: int
     max_seqlen_x: int
     x_prefix_indices: Tensor
+    trust_metadata: bool = field(default=False, kw_only=True)
+    metadata_verified: bool = field(default=False, init=False)
     cu_seqlens_v: Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
@@ -77,21 +83,27 @@ class PackedMemoryQueryLayout:
             "max_seqlen_x",
         ):
             positive_int(name, getattr(self, name))
+        if not isinstance(self.trust_metadata, bool):
+            raise ValueError("trust_metadata must be an explicit boolean")
+        if max(self.num_memory_tokens, self.num_query_tokens) > 2**31 - 1:
+            raise ValueError("packed stream totals must fit int32")
         offsets = (self.cu_seqlens_m, self.cu_seqlens_q, self.cu_seqlens_x)
         for name, tensor in zip(
             ("cu_seqlens_m", "cu_seqlens_q", "cu_seqlens_x"), offsets
         ):
             if (
-                tensor.ndim != 1
+                not isinstance(tensor, Tensor)
+                or tensor.ndim != 1
                 or tensor.numel() < 2
                 or tensor.dtype not in (torch.int32, torch.int64)
             ):
                 raise ValueError(
                     f"{name} must be a 1D int32/int64 tensor with at least two offsets"
                 )
-            object.__setattr__(self, name, tensor.to(torch.int32).contiguous())
         if len({t.numel() for t in offsets}) != 1:
             raise ValueError("all offset arrays must describe the same batch size")
+        if not isinstance(self.x_prefix_indices, Tensor):
+            raise ValueError("x_prefix_indices must be a tensor")
         if any(
             t.device != self.cu_seqlens_m.device
             for t in (*offsets, self.x_prefix_indices)
@@ -109,6 +121,30 @@ class PackedMemoryQueryLayout:
             )
         if min(self.num_memory_tokens, self.num_query_tokens) < self.batch_size:
             raise ValueError("every memory/query sequence must be nonempty")
+        nx = self.x_prefix_indices.numel()
+        if self.num_memory_tokens != nx + self.num_query_tokens - self.batch_size:
+            raise ValueError(
+                "packed totals violate the NCSE memory = x + query - 1 invariant"
+            )
+        for maximum, total in (
+            (self.max_seqlen_m, self.num_memory_tokens),
+            (self.max_seqlen_q, self.num_query_tokens),
+            (self.max_seqlen_x, nx),
+        ):
+            if maximum > total:
+                raise ValueError("a sequence maximum cannot exceed its stream total")
+        if not self.trust_metadata:
+            if self.cu_seqlens_m.device.type != "cpu":
+                raise ValueError(
+                    "device-resident metadata requires explicit trust_metadata=True; "
+                    "use from_lengths() for verified NCSE construction"
+                )
+            self._verify_cpu_values()
+            object.__setattr__(self, "metadata_verified", True)
+        for name, tensor in zip(
+            ("cu_seqlens_m", "cu_seqlens_q", "cu_seqlens_x"), offsets
+        ):
+            object.__setattr__(self, name, tensor.to(torch.int32).contiguous())
         object.__setattr__(self, "x_prefix_indices", self.x_prefix_indices.contiguous())
         object.__setattr__(
             self,
@@ -117,6 +153,46 @@ class PackedMemoryQueryLayout:
                 self.batch_size + 1, dtype=torch.int32, device=self.cu_seqlens_m.device
             ),
         )
+
+    def _verify_cpu_values(self):
+        offsets = [
+            t.tolist()
+            for t in (self.cu_seqlens_m, self.cu_seqlens_q, self.cu_seqlens_x)
+        ]
+        lengths = []
+        for values, total, maximum in zip(
+            offsets,
+            (
+                self.num_memory_tokens,
+                self.num_query_tokens,
+                self.x_prefix_indices.numel(),
+            ),
+            (self.max_seqlen_m, self.max_seqlen_q, self.max_seqlen_x),
+        ):
+            if values[0] != 0 or values[-1] != total or total > 2**31 - 1:
+                raise ValueError(
+                    "offsets must start at zero, end at their total, and fit int32"
+                )
+            sizes = [b - a for a, b in zip(values, values[1:])]
+            if any(size <= 0 or size > maximum for size in sizes):
+                raise ValueError(
+                    "offsets must describe nonempty samples within the maximum"
+                )
+            lengths.append(sizes)
+        for sample, (m, q, x) in enumerate(zip(*lengths)):
+            if m != x + q - 1:
+                raise ValueError(
+                    f"NCSE sample {sample} requires memory_length = x_prefix_length + query_length - 1"
+                )
+        expected = [
+            index
+            for start, length in zip(offsets[0][:-1], lengths[2])
+            for index in range(start, start + length)
+        ]
+        if self.x_prefix_indices.tolist() != expected:
+            raise ValueError(
+                "x_prefix_indices must select exactly each sample's x-prefix"
+            )
 
     @property
     def batch_size(self):
@@ -155,6 +231,11 @@ class PackedMemoryQueryLayout:
                 raise ValueError("packed offsets must fit int32")
         if any(x > m for x, m in zip(xl, ml)):
             raise ValueError("each x-prefix length must not exceed its memory length")
+        for sample, (m, q, x) in enumerate(zip(ml, ql, xl)):
+            if m != x + q - 1:
+                raise ValueError(
+                    f"NCSE sample {sample} requires memory_length = x_prefix_length + query_length - 1"
+                )
         mo, qo, xo = ([0, *accumulate(lengths)] for lengths in (ml, ql, xl))
         offsets = [
             torch.tensor(o, dtype=torch.int32, device=device) for o in (mo, qo, xo)
@@ -166,7 +247,18 @@ class PackedMemoryQueryLayout:
         indices = torch.arange(sum(xl), device=device) + torch.repeat_interleave(
             shifts, torch.tensor(xl, device=device), output_size=sum(xl)
         )
-        return cls(sum(ml), sum(ql), *offsets, max(ml), max(ql), max(xl), indices)
+        result = cls(
+            sum(ml),
+            sum(ql),
+            *offsets,
+            max(ml),
+            max(ql),
+            max(xl),
+            indices,
+            trust_metadata=True,
+        )
+        object.__setattr__(result, "metadata_verified", True)
+        return result
 
     @classmethod
     def ncse(
@@ -192,8 +284,9 @@ class PackedMemoryQueryLayout:
         )
 
     def to(self, device):
-        return replace(
+        result = replace(
             self,
+            trust_metadata=True,
             **{
                 name: getattr(self, name).to(device)
                 for name in (
@@ -204,6 +297,8 @@ class PackedMemoryQueryLayout:
                 )
             },
         )
+        object.__setattr__(result, "metadata_verified", self.metadata_verified)
+        return result
 
     def validate(self, hidden_states: Tensor, emb_dim: int):
         if (

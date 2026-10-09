@@ -102,7 +102,10 @@ for block in blocks:
 y = h + residual
 ```
 
-For other geometries, `FixedMemoryQueryLayout(memory_length, query_length, x_prefix_length)` specifies the independent lengths.
+`FixedMemoryQueryLayout(memory_length, query_length, x_prefix_length)` also accepts
+explicit lengths, but requires `memory_length = x_prefix_length + query_length - 1`.
+Non-NCSE geometries are rejected. Standalone `CrossMHA` still supports general
+rectangular attention.
 
 ### Packed memory/query layout
 
@@ -121,7 +124,25 @@ for block in blocks:
 y = h + residual
 ```
 
-In this example, the memory lengths are `[6, 3]`; the packed state contains 9 memory tokens, 2 volume tokens and 6 density tokens, totaling 17. General layouts are available through `PackedMemoryQueryLayout.from_lengths(memory_lengths, query_lengths, x_prefix_lengths, device=...)`. The direct packed-layout constructor also supports existing device-side metadata. Layout tensors and state tensors occupy the same device; `.to(device)` produces a device-local layout.
+In this example, the memory lengths are `[6, 3]`; the packed state contains 9 memory
+tokens, 2 volume tokens and 6 density tokens, totaling 17.
+`PackedMemoryQueryLayout.from_lengths(memory_lengths, query_lengths,
+x_prefix_lengths, device=...)` verifies the NCSE equation for every sample using
+host Python lengths, then constructs reusable device metadata without reading
+CUDA tensors. These builders set `metadata_verified=True`.
+
+Direct packed construction validates CPU offset/index values by default.
+Already-device-resident metadata requires the explicit keyword
+`trust_metadata=True`, yielding `metadata_verified=False`. The caller then
+guarantees positive lengths, exact per-sample NCSE geometry, correct prefix
+indices, and int32-compatible offsets. Structural checks still run. Layout
+tensors and state tensors occupy the same device; `.to(device)` preserves the
+verification status.
+
+Layouts guarantee the attention geometry, not the semantic contents of embeddings.
+The caller must ensure that a density query's initial embedding does not already
+contain its target or future conditioning values. The transformer cannot validate
+arbitrary user-produced token contents.
 
 ### Precision and limitations
 

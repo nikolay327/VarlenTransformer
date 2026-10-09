@@ -401,27 +401,14 @@ def test_invalid_block_configuration(memory_reference_backend, kwargs):
 
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("sm,d,t", [(3, 6, 2), (4, 4, 3), (7, 3, 4)])
-def test_general_rectangular_block_geometry(memory_reference_backend, packed, sm, d, t):
-    layout = (
-        PackedMemoryQueryLayout.from_lengths([sm, sm + 1], [d, max(1, d - 1)], [t, t])
-        if packed
-        else FixedMemoryQueryLayout(sm, d, t)
-    )
-    shape = (layout.total_tokens, 16) if packed else (2, sm + 1 + d, 16)
-    block = MemoryQueryBlock(16, 32, 2)
-    ref = copy.deepcopy(block)
-    x = torch.randn(shape, requires_grad=True)
-    ex = x.detach().clone().requires_grad_()
-    actual = block(x, layout=layout)
-    expected = memory_query_block_forward(ref, ex, None, layout)
-    for a, b in zip(actual, expected):
-        torch.testing.assert_close(a, b, rtol=0, atol=0)
-    gradient = tuple(torch.randn_like(t) / t.numel() ** 0.5 for t in actual)
-    assert_gradients(
-        torch.autograd.grad(actual, (x, *block.parameters()), gradient),
-        torch.autograd.grad(expected, (ex, *ref.parameters()), gradient),
-        relative_l2=0.04,
-    )
+def test_non_ncse_block_geometry_is_rejected(packed, sm, d, t):
+    with pytest.raises(ValueError, match="NCSE"):
+        if packed:
+            PackedMemoryQueryLayout.from_lengths(
+                [sm, sm + 1], [d, max(1, d - 1)], [t, t]
+            )
+        else:
+            FixedMemoryQueryLayout(sm, d, t)
 
 
 @pytest.mark.parametrize(
