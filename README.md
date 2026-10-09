@@ -182,17 +182,51 @@ python -m pytest --require-cuda
 
 `--require-cuda` fails when the required GPU or FlashAttention environment is unavailable, rather than silently skipping CUDA tests. GitHub Actions runs CPU tests automatically; the GPU workflow is manually triggered on a compatible self-hosted runner.
 
-## CUDA benchmarks
+## Local CUDA benchmarking and visualization
 
-`benchmarks/profile_memory_query.py` measures forward-only inference and forward/backward training using CUDA events. It supports native and adapter-based fixed layouts, heterogeneous packed layouts, configurable block depth, and optional profiler traces.
+`benchmarks/profile_memory_query.py` benchmarks inference and forward/backward
+training using CUDA events. It reports median and p10/p90 latency, throughput,
+GPU memory allocation, and hardware/software metadata. Setup and initialization
+are excluded from timings; training includes backward but not optimizer steps.
+
+Examples from the repository root:
 
 ```bash
-python benchmarks/profile_memory_query.py --implementation native --layout fixed --depth 4
-python benchmarks/profile_memory_query.py --implementation wrapper --layout fixed --depth 1 --mode train
-python benchmarks/profile_memory_query.py --layout packed --batch-size 3 --memory-lengths 7,31,127 --query-lengths 3,4,5
+python benchmarks/profile_memory_query.py \
+  --implementation native --layout fixed --depth 4 \
+  --output benchmark-results/native-fixed
+
+python benchmarks/profile_memory_query.py \
+  --implementation wrapper --layout fixed --depth 4 --mode train \
+  --output benchmark-results/wrapper-train
+
+python benchmarks/profile_memory_query.py \
+  --layout packed --batch-size 3 \
+  --memory-lengths 7,31,127 --query-lengths 3,4,5 \
+  --output benchmark-results/packed
 ```
 
-The profiler writes a terminal summary and JSON/CSV reports to `benchmark-results/` or a specified output directory. Reports include latency distributions, throughput, GPU memory usage, and environment metadata. Baseline comparisons are supported through the command-line comparison options; `--help` describes the available settings. Measurements are hardware-dependent and are not correctness tests.
+Native fixed-layout measurements separate the flat core from adapter-inclusive
+execution. Each output directory contains `report.json` and `report.csv`.
+
+To create PNG charts from a report, install the optional plotting dependency
+(`python -m pip install ".[viz]"`) and run:
+
+```bash
+python benchmarks/visualize_memory_query.py benchmark-results/native-fixed/report.json
+```
+
+The visualizer plots latency with p10/p90 ranges, throughput, and peak allocated
+GPU memory. Reports with baseline comparisons also produce speedup and absolute
+latency-comparison charts. Images are saved next to the report unless `--output`
+specifies another directory.
+
+For before/after measurements, the driver supports `--implementation legacy`
+with `--source-root` pointing to a separate checkout at its recorded baseline
+commit, and `--baseline-json` when measuring the revised implementation.
+Comparisons require compatible hardware, software, and workload configurations.
+Use `--help` for all options or `--trace PATH` for an optional Chrome trace.
+The generated data and traces are not committed or used as CI test thresholds.
 
 ## AI use
 

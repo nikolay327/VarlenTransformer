@@ -84,6 +84,7 @@ def test_sdist_includes_tests_docs_and_workflows(distributions):
             "/tests/test_cuda.py",
             "/tests/test_custom_ops.py",
             "/benchmarks/profile_memory_query.py",
+            "/benchmarks/visualize_memory_query.py",
             "/.github/workflows/tests.yml",
             "/.github/workflows/gpu-tests.yml",
         ):
