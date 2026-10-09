@@ -30,7 +30,7 @@ exclude = ["**/__pycache__", "**/*.pyc", "**/*.pyo", ".pytest_cache", ".coverage
 packages = ["src/varlen_transformer"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/.github", "/README.md", "/LICENSE", "/THIRD_PARTY_NOTICES.md", "/pyproject.toml"]
+include = ["/src", "/tests", "/benchmarks", "/.github", "/README.md", "/LICENSE", "/THIRD_PARTY_NOTICES.md", "/pyproject.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
