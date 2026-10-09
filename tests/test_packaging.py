@@ -31,7 +31,18 @@ def test_wheel_contains_importable_modules_and_license_metadata(distributions):
     wheel, _ = distributions
     with ZipFile(wheel) as archive:
         names = archive.namelist()
-        for module in ("__init__", "block", "cls", "mha", "mlp", "_validation"):
+        for module in (
+            "__init__",
+            "block",
+            "cls",
+            "mha",
+            "mlp",
+            "_validation",
+            "cross_mha",
+            "layout",
+            "memory_query",
+            "_memory_ops",
+        ):
             assert f"varlen_transformer/{module}.py" in names
         assert not any("/kernels/" in name or "__pycache__" in name for name in names)
         metadata = email.message_from_bytes(
@@ -69,13 +80,14 @@ def test_sdist_includes_tests_docs_and_workflows(distributions):
         for suffix in (
             "/README.md",
             "/LICENSE",
-            "/TESTING.md",
             "/tests/test_cuda.py",
             "/tests/test_custom_ops.py",
             "/.github/workflows/tests.yml",
             "/.github/workflows/gpu-tests.yml",
         ):
             assert any(name.endswith(suffix) for name in names), suffix
+        for obsolete in ("/TESTING.md", "/MEMORY_QUERY.md", "/REVIEW.md"):
+            assert not any(name.endswith(obsolete) for name in names), obsolete
         assert not any("/kernels/" in name or "__pycache__" in name for name in names)
 
 
@@ -112,7 +124,8 @@ sys.path.insert(0, sys.argv[1])
 import torch
 import varlen_transformer as vt
 assert Path(vt.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve())
-assert set(vt.__all__) == {"Block", "MHA", "MLP", "create_block"}
+assert set(vt.__all__) == {"Block", "MHA", "MLP", "create_block", "CrossMHA",
+    "MemoryQueryBlock", "FixedMemoryQueryLayout", "PackedMemoryQueryLayout", "create_memory_query_block"}
 assert vt.MLP(8, 16)(torch.ones(2, 8)).shape == (2, 8)
 try:
     vt.create_block(16, 32, 2)
