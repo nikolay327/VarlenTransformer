@@ -36,3 +36,34 @@ def validate_attention_input(
             raise ValueError("cu_seqlens must have dtype int32 or int64")
         if cu_seqlens.device != x.device:
             raise ValueError("cu_seqlens and hidden states must be on the same device")
+
+
+def validate_cross_attention_input(
+    q: Tensor,
+    kv: Tensor,
+    emb_dim: int,
+    cu_seqlens_q: Tensor | None,
+    cu_seqlens_k: Tensor | None,
+    max_seqlen_q: int | None,
+    max_seqlen_k: int | None,
+) -> None:
+    metadata = (cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
+    if any(v is not None for v in metadata) and not all(
+        v is not None for v in metadata
+    ):
+        raise ValueError(
+            "all four query/key sequence metadata arguments must be provided together"
+        )
+    validate_attention_input(q, emb_dim, cu_seqlens_q, max_seqlen_q)
+    validate_attention_input(kv, emb_dim, cu_seqlens_k, max_seqlen_k)
+    if q.device != kv.device or q.dtype != kv.dtype:
+        raise ValueError(
+            "query and key/value inputs must have the same device and dtype"
+        )
+    if cu_seqlens_q is None:
+        if q.shape[0] != kv.shape[0]:
+            raise ValueError("query and key/value batch sizes must match")
+    elif cu_seqlens_q.numel() != cu_seqlens_k.numel():
+        raise ValueError(
+            "query and key/value offsets must describe the same batch size"
+        )

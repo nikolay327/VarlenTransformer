@@ -7,6 +7,58 @@ from packaging.version import Version
 from tests.reference import ReferenceSelfAttention, attention, packed_attention
 
 
+@pytest.fixture
+def cross_reference_backend(monkeypatch):
+    from tests.reference import ReferenceCrossAttention
+    import varlen_transformer.cross_mha as cross
+
+    monkeypatch.setattr(cross, "FlashCrossAttention", ReferenceCrossAttention)
+
+
+@pytest.fixture
+def memory_reference_backend(reference_backend, cross_reference_backend, monkeypatch):
+    import varlen_transformer.memory_query as memory
+    from tests.reference import cross_attention, packed_cross_attention
+
+    calls = []
+
+    def sa_fixed(qkv, **kw):
+        calls.append(dict(kind="sa", packed=False, qkv=qkv, **kw))
+        return attention(qkv, **kw)
+
+    def sa_packed(qkv, cu, maximum, **kw):
+        calls.append(
+            dict(kind="sa", packed=True, qkv=qkv, cu=cu, maximum=maximum, **kw)
+        )
+        return packed_attention(qkv, cu, maximum, **kw)
+
+    def ca_fixed(q, kv, **kw):
+        calls.append(dict(kind="ca", packed=False, q=q, kv=kv, **kw))
+        return cross_attention(q, kv, **kw)
+
+    def ca_packed(q, kv, cuq, cuk, maxq, maxk, **kw):
+        calls.append(
+            dict(
+                kind="ca",
+                packed=True,
+                q=q,
+                kv=kv,
+                cuq=cuq,
+                cuk=cuk,
+                maxq=maxq,
+                maxk=maxk,
+                **kw,
+            )
+        )
+        return packed_cross_attention(q, kv, cuq, cuk, maxq, maxk, **kw)
+
+    monkeypatch.setattr(memory, "flash_attn_qkvpacked_func", sa_fixed)
+    monkeypatch.setattr(memory, "flash_attn_varlen_qkvpacked_func", sa_packed)
+    monkeypatch.setattr(memory, "flash_attn_kvpacked_func", ca_fixed)
+    monkeypatch.setattr(memory, "flash_attn_varlen_kvpacked_func", ca_packed)
+    return calls
+
+
 def pytest_addoption(parser):
     parser.addoption(
         "--require-cuda",
@@ -28,7 +80,7 @@ def cuda_unavailable_reason():
         return "FlashAttention is not installed"
     try:
         import flash_attn
-        from flash_attn.modules.mha import FlashSelfAttention
+        from flash_attn.modules.mha import FlashSelfAttention, FlashCrossAttention
 
         if not Version("2.6") <= Version(flash_attn.__version__) < Version("3"):
             return "the CUDA suite requires FlashAttention 2.6–2.x"
@@ -36,6 +88,10 @@ def cuda_unavailable_reason():
         assert callable(flash_attn.flash_attn_qkvpacked_func) and callable(
             FlashSelfAttention
         )
+        assert callable(FlashCrossAttention) and callable(
+            flash_attn.flash_attn_kvpacked_func
+        )
+        assert callable(flash_attn.flash_attn_varlen_kvpacked_func)
     except (ImportError, OSError, RuntimeError, AssertionError) as exc:
         raise pytest.UsageError(f"Installed FlashAttention cannot load: {exc}") from exc
     return None

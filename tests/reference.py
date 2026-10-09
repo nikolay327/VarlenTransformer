@@ -154,6 +154,213 @@ def clone_args(args):
     )
 
 
+def cross_attention(
+    q, kv, *, causal=False, dropout_p=0.0, softmax_scale=None, window_size=(-1, -1), **_
+):
+    """Independent FP32 rectangular attention, with safe fully-masked rows."""
+    query = q.transpose(1, 2).float()
+    key, value = (t.transpose(1, 2).float() for t in kv.unbind(dim=2))
+    sq, sk = query.shape[-2], key.shape[-2]
+    scale = query.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
+    scores = query @ key.transpose(-1, -2) * scale
+    rows = torch.arange(sq, device=q.device)[:, None] + sk - sq
+    cols = torch.arange(sk, device=q.device)[None, :]
+    allowed = torch.ones((sq, sk), dtype=torch.bool, device=q.device)
+    if causal:
+        allowed &= cols <= rows
+    left, right = window_size
+    if left >= 0:
+        allowed &= cols >= rows - left
+    if right >= 0:
+        allowed &= cols <= rows + right
+    valid = allowed.any(-1, keepdim=True)
+    logits = scores.masked_fill(~allowed, -torch.inf)
+    logits = torch.where(valid, logits, torch.zeros_like(logits))
+    probabilities = logits.softmax(-1) * valid.to(logits.dtype)
+    probabilities = F.dropout(probabilities, dropout_p, training=dropout_p > 0)
+    return (probabilities @ value).transpose(1, 2).to(q.dtype)
+
+
+def packed_cross_attention(
+    q, kv, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs
+):
+    qo, ko = cu_seqlens_q.tolist(), cu_seqlens_k.tolist()
+    assert len(qo) == len(ko)
+    assert qo[0] == ko[0] == 0 and qo[-1] == len(q) and ko[-1] == len(kv)
+    assert all(0 < b - a <= max_seqlen_q for a, b in zip(qo, qo[1:]))
+    assert all(0 < b - a <= max_seqlen_k for a, b in zip(ko, ko[1:]))
+    return torch.cat(
+        [
+            cross_attention(
+                q[qa:qb].unsqueeze(0), kv[ka:kb].unsqueeze(0), **kwargs
+            ).squeeze(0)
+            for qa, qb, ka, kb in zip(qo, qo[1:], ko, ko[1:])
+        ]
+    )
+
+
+class ReferenceCrossAttention(nn.Module):
+    """Matches FlashCrossAttention's *actual* query metadata argument names."""
+
+    def __init__(self, causal=False, attention_dropout=0.0):
+        super().__init__()
+        self.causal = causal
+        self.drop = nn.Dropout(attention_dropout)
+        self.softmax_scale = None
+        self.window_size = (-1, -1)
+        self.deterministic = False
+        self.alibi_slopes = None
+
+    def forward(
+        self,
+        q,
+        kv,
+        causal=None,
+        cu_seqlens=None,
+        max_seqlen=None,
+        cu_seqlens_k=None,
+        max_seqlen_k=None,
+    ):
+        kwargs = dict(
+            causal=self.causal if causal is None else causal,
+            dropout_p=self.drop.p if self.training else 0.0,
+            softmax_scale=self.softmax_scale,
+            window_size=self.window_size,
+        )
+        if cu_seqlens is None:
+            return cross_attention(q, kv, **kwargs)
+        return packed_cross_attention(
+            q, kv, cu_seqlens, cu_seqlens_k, max_seqlen, max_seqlen_k, **kwargs
+        )
+
+
+def cross_mha_forward(module, q, kv, cu_q=None, cu_k=None, max_q=None, max_k=None):
+    pq = F.linear(q, module.Wq.weight, module.Wq.bias).reshape(
+        *q.shape[:-1], module.num_heads, module.head_dim
+    )
+    pkv = F.linear(kv, module.Wkv.weight, module.Wkv.bias).reshape(
+        *kv.shape[:-1], 2, module.num_heads, module.head_dim
+    )
+    kwargs = dict(
+        causal=module.causal,
+        softmax_scale=module.attn.softmax_scale,
+        window_size=module.attn.window_size,
+    )
+    a = (
+        cross_attention(pq, pkv, **kwargs)
+        if cu_q is None
+        else packed_cross_attention(pq, pkv, cu_q, cu_k, max_q, max_k, **kwargs)
+    )
+    return F.linear(a.reshape_as(q), module.out_proj.weight, module.out_proj.bias)
+
+
+def memory_query_block_forward(block, x, residual, layout):
+    """Independent eager oracle. Packed prefixes are sliced per sample;
+    the optimized gather indices are deliberately not used here.
+    """
+    assert not block.training or all(
+        p == 0
+        for p in (
+            block.dropout_input.p,
+            block.dropout_sa.p,
+            block.dropout_ca.p,
+            block.memory_mixer.attn.drop.p,
+            block.cross_mixer.attn.drop.p,
+        )
+    )
+
+    def norm(value, layer):
+        return F.layer_norm(
+            value.float(),
+            (value.shape[-1],),
+            layer.weight.float(),
+            layer.bias.float(),
+            layer.eps,
+        ).bfloat16()
+
+    def linear(value, layer):
+        return F.linear(
+            value.reshape(-1, value.shape[-1]),
+            layer.weight.bfloat16(),
+            layer.bias.bfloat16(),
+        ).reshape(*value.shape[:-1], layer.weight.shape[0])
+
+    packed = x.ndim == 2
+    n = layout.num_memory_tokens
+    h, r = (
+        x.bfloat16(),
+        torch.zeros_like(x, dtype=torch.bfloat16)
+        if residual is None
+        else residual.bfloat16(),
+    )
+    r0 = r + h
+    m0, queries0 = r0.narrow(-2, 0, n), r0.narrow(-2, n, r0.shape[-2] - n)
+    mixer = block.memory_mixer
+    qkv = linear(norm(m0, block.norm_sa), mixer.Wqkv).reshape(
+        *m0.shape[:-1], 3, mixer.num_heads, mixer.head_dim
+    )
+    opts = dict(
+        causal=True,
+        softmax_scale=mixer.attn.softmax_scale,
+        window_size=mixer.attn.window_size,
+    )
+    am = (
+        packed_attention(qkv, layout.cu_seqlens_m, layout.max_seqlen_m, **opts)
+        if packed
+        else attention(qkv, **opts)
+    )
+    m1 = m0 + linear(am.reshape_as(m0), mixer.out_proj)
+    rca = torch.cat((m1, queries0), dim=-2)
+    normalized = norm(rca, block.norm_ca)
+    cross = block.cross_mixer
+    q_all = linear(normalized.narrow(-2, n, rca.shape[-2] - n), cross.Wq).reshape(
+        *queries0.shape[:-1], cross.num_heads, cross.head_dim
+    )
+    kv_m = linear(normalized.narrow(-2, 0, n), cross.Wkv).reshape(
+        *m1.shape[:-1], 2, cross.num_heads, cross.head_dim
+    )
+    opts = dict(
+        softmax_scale=cross.attn.softmax_scale, window_size=cross.attn.window_size
+    )
+    if not packed:
+        av = cross_attention(
+            q_all[:, :1], kv_m[:, : layout.x_prefix_length], causal=False, **opts
+        )
+        aq = cross_attention(q_all[:, 1:], kv_m, causal=True, **opts)
+    else:
+        mo, qo, xo = (
+            layout.cu_seqlens_m.tolist(),
+            layout.cu_seqlens_q.tolist(),
+            layout.cu_seqlens_x.tolist(),
+        )
+        avs, aqs = [], []
+        b = len(mo) - 1
+        for i in range(b):
+            memory = kv_m[mo[i] : mo[i + 1]].unsqueeze(0)
+            avs.append(
+                cross_attention(
+                    q_all[i : i + 1].unsqueeze(0),
+                    memory[:, : xo[i + 1] - xo[i]],
+                    causal=False,
+                    **opts,
+                ).squeeze(0)
+            )
+            aqs.append(
+                cross_attention(
+                    q_all[b + qo[i] : b + qo[i + 1]].unsqueeze(0),
+                    memory,
+                    causal=True,
+                    **opts,
+                ).squeeze(0)
+            )
+        av, aq = torch.cat(avs), torch.cat(aqs)
+    projected = linear(torch.cat((av, aq), dim=-3).reshape_as(queries0), cross.out_proj)
+    r1 = torch.cat((m1, queries0 + projected), dim=-2)
+    z = norm(r1, block.norm_mlp)
+    branch = linear(F.gelu(linear(z, block.mlp.fc1), approximate="tanh"), block.mlp.fc2)
+    return branch, r1
+
+
 def pre_args(
     shape=(5, 16),
     *,
