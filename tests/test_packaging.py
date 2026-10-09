@@ -41,6 +41,7 @@ def test_wheel_contains_importable_modules_and_license_metadata(distributions):
             "cross_mha",
             "layout",
             "memory_query",
+            "stack",
             "_memory_ops",
         ):
             assert f"varlen_transformer/{module}.py" in names
@@ -125,7 +126,8 @@ import torch
 import varlen_transformer as vt
 assert Path(vt.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve())
 assert set(vt.__all__) == {"Block", "MHA", "MLP", "create_block", "CrossMHA",
-    "MemoryQueryBlock", "FixedMemoryQueryLayout", "PackedMemoryQueryLayout", "create_memory_query_block"}
+    "MemoryQueryBlock", "FixedMemoryQueryLayout", "PackedMemoryQueryLayout", "create_memory_query_block", "FixedMemoryQueryStack",
+    "pack_fixed_memory_query", "unpack_fixed_memory_query"}
 assert vt.MLP(8, 16)(torch.ones(2, 8)).shape == (2, 8)
 try:
     vt.create_block(16, 32, 2)

@@ -83,29 +83,58 @@ Standalone `MHA` and `CrossMHA` follow ordinary PyTorch projection dtype rules (
 
 `MemoryQueryBlock` is a specialized block rather than a replacement for general-purpose `CrossMHA`.
 
-### Fixed-length memory/query layout
+### Native stream-major storage and fixed attention
 
-Each sample contains `[M; V; Q]` with shape `(batch, memory_length + 1 + query_length, emb_dim)`. The `ncse` convenience constructor sets `memory_length = x_prefix_length + query_length - 1`:
+Both fixed and packed native blocks consume and return flat `(N_total,E)` tensors,
+ordered `[all M; all V; all Q]`. Here `N_total = N_M + B + N_Q`; both the branch
+and residual use this same representation throughout the stack.
+
+Fixed metadata includes an explicit batch size. The core views its contiguous
+regions as `(B,Sm,E)`, `(B,1,E)` and `(B,Sq,E)` and calls the **fixed-length**
+FlashAttention kernels, not varlen kernels:
 
 ```python
 import torch
 from varlen_transformer import FixedMemoryQueryLayout, create_memory_query_block
 
-layout = FixedMemoryQueryLayout.ncse(x_prefix_length=3, query_length=4)
+layout = FixedMemoryQueryLayout.ncse(x_prefix_length=3, query_length=4, batch_size=2)
 blocks = torch.nn.ModuleList([
     create_memory_query_block(128, 512, 4).cuda() for _ in range(2)
 ])
-h = torch.randn(2, 11, 128, device="cuda", requires_grad=True)
+h = torch.randn(layout.total_tokens, 128, device="cuda", requires_grad=True)
 residual = None
 for block in blocks:
     h, residual = block(h, residual, layout=layout)
 y = h + residual
 ```
 
-`FixedMemoryQueryLayout(memory_length, query_length, x_prefix_length)` also accepts
-explicit lengths, but requires `memory_length = x_prefix_length + query_length - 1`.
-Non-NCSE geometries are rejected. Standalone `CrossMHA` still supports general
-rectangular attention.
+Explicit construction uses `FixedMemoryQueryLayout(memory_length, query_length,
+x_prefix_length, batch_size=B)` and requires
+`memory_length = x_prefix_length + query_length - 1`. Non-NCSE geometries are
+rejected. Standalone `CrossMHA` still supports general rectangular attention.
+
+### Per-sample fixed input adapter
+
+For existing `(B,Sm+1+Sq,E)` input ordered `[M;V;Q]` within each sample, wrap the
+**entire stack** once:
+
+```python
+from varlen_transformer import FixedMemoryQueryStack
+
+stack = FixedMemoryQueryStack(blocks)
+x = torch.randn(2, 11, 128, device="cuda", requires_grad=True)
+h, residual = stack(x, layout=layout)
+y = h + residual  # (2,11,128), both outputs BF16
+```
+
+`FixedMemoryQueryStack.forward(hidden_states, residual=None, *, layout,
+return_stream_major=False)` converts each input state once at entry and each
+output once at exit, preserving gradients through both conversions. Setting
+`return_stream_major=True` keeps both outputs flat. The public
+`pack_fixed_memory_query(state, layout)` and `unpack_fixed_memory_query(state,
+layout)` helpers expose these conversions for manual composition. Native
+`MemoryQueryBlock` rejects legacy 3D input with explicit adapter guidance;
+stacking one-block adapters would repeat conversion work and is not the fast path.
 
 ### Packed memory/query layout
 

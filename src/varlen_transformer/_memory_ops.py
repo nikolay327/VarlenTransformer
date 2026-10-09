@@ -2,6 +2,11 @@
 
 All public outputs own storage. Saved norm statistics/intermediates are exposed
 only for autograd registration and testing, and are nondifferentiable.
+
+The native block supplies one flat stream-major token matrix. memory_tokens is
+the total memory span for the entire batch, so every projection/norm operates
+on a contiguous region rather than strided per-sample slices. The arithmetic
+helpers also accept leading batch dimensions for direct operator tests.
 """
 
 import torch

@@ -285,7 +285,9 @@ def memory_query_block_forward(block, x, residual, layout):
             layer.bias.bfloat16(),
         ).reshape(*value.shape[:-1], layer.weight.shape[0])
 
-    packed = x.ndim == 2
+    from varlen_transformer.layout import PackedMemoryQueryLayout
+
+    packed = isinstance(layout, PackedMemoryQueryLayout)
     n = layout.num_memory_tokens
     h, r = (
         x.bfloat16(),
@@ -307,7 +309,16 @@ def memory_query_block_forward(block, x, residual, layout):
     am = (
         packed_attention(qkv, layout.cu_seqlens_m, layout.max_seqlen_m, **opts)
         if packed
-        else attention(qkv, **opts)
+        else attention(
+            qkv.view(
+                layout.batch_size,
+                layout.memory_length,
+                3,
+                mixer.num_heads,
+                mixer.head_dim,
+            ),
+            **opts,
+        )
     )
     m1 = m0 + linear(am.reshape_as(m0), mixer.out_proj)
     rca = torch.cat((m1, queries0), dim=-2)
@@ -323,10 +334,24 @@ def memory_query_block_forward(block, x, residual, layout):
         softmax_scale=cross.attn.softmax_scale, window_size=cross.attn.window_size
     )
     if not packed:
-        av = cross_attention(
-            q_all[:, :1], kv_m[:, : layout.x_prefix_length], causal=False, **opts
+        b = layout.batch_size
+        fixed_memory = kv_m.view(
+            b, layout.memory_length, 2, cross.num_heads, cross.head_dim
         )
-        aq = cross_attention(q_all[:, 1:], kv_m, causal=True, **opts)
+        av = cross_attention(
+            q_all[:b].view(b, 1, cross.num_heads, cross.head_dim),
+            fixed_memory[:, : layout.x_prefix_length],
+            causal=False,
+            **opts,
+        )
+        aq = cross_attention(
+            q_all[b:].view(b, layout.query_length, cross.num_heads, cross.head_dim),
+            fixed_memory,
+            causal=True,
+            **opts,
+        )
+        av = av.reshape(b, cross.num_heads, cross.head_dim)
+        aq = aq.reshape(layout.num_query_tokens, cross.num_heads, cross.head_dim)
     else:
         mo, qo, xo = (
             layout.cu_seqlens_m.tolist(),

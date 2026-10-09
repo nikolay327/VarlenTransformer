@@ -9,7 +9,7 @@ from varlen_transformer import FixedMemoryQueryLayout, PackedMemoryQueryLayout
 @pytest.mark.parametrize("m,q,x", [(3, 6, 2), (4, 4, 3), (7, 3, 4)])
 def test_fixed_rejects_non_autoregressive_geometry(m, q, x):
     with pytest.raises(ValueError, match="memory_length = x_prefix_length"):
-        FixedMemoryQueryLayout(m, q, x)
+        FixedMemoryQueryLayout(m, q, x, batch_size=1)
 
 
 @pytest.mark.parametrize("memory", [[6, 4, 5], [5, 3, 5], [6, 2, 6]])

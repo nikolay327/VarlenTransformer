@@ -12,14 +12,15 @@ from ._validation import positive_int
 
 @dataclass(frozen=True)
 class FixedMemoryQueryLayout:
-    """Per-sample state is (B, memory_length + 1 + query_length, E)."""
+    """Flat [all M; all V; all Q] state with uniform fixed-kernel geometry."""
 
     memory_length: int
     query_length: int
     x_prefix_length: int
+    batch_size: int = field(kw_only=True)
 
     def __post_init__(self):
-        for name in ("memory_length", "query_length", "x_prefix_length"):
+        for name in ("memory_length", "query_length", "x_prefix_length", "batch_size"):
             positive_int(name, getattr(self, name))
         if self.x_prefix_length > self.memory_length:
             raise ValueError("x_prefix_length cannot exceed memory_length")
@@ -29,26 +30,39 @@ class FixedMemoryQueryLayout:
             )
 
     @classmethod
-    def ncse(cls, x_prefix_length: int, query_length: int):
+    def ncse(cls, x_prefix_length: int, query_length: int, *, batch_size: int):
         """M=[x; theta_<D], Q has D tokens, with native rectangular causality."""
         positive_int("x_prefix_length", x_prefix_length)
         positive_int("query_length", query_length)
-        return cls(x_prefix_length + query_length - 1, query_length, x_prefix_length)
+        return cls(
+            x_prefix_length + query_length - 1,
+            query_length,
+            x_prefix_length,
+            batch_size=batch_size,
+        )
 
     @property
     def num_memory_tokens(self):
-        return self.memory_length
+        return self.batch_size * self.memory_length
+
+    @property
+    def num_query_tokens(self):
+        return self.batch_size * self.query_length
+
+    @property
+    def total_tokens(self):
+        return self.num_memory_tokens + self.batch_size + self.num_query_tokens
 
     def validate(self, hidden_states: Tensor, emb_dim: int):
-        expected = self.memory_length + 1 + self.query_length
+        expected = self.total_tokens
         if (
-            hidden_states.ndim != 3
-            or hidden_states.shape[0] == 0
-            or hidden_states.shape[1:] != (expected, emb_dim)
+            hidden_states.ndim != 2
+            or hidden_states.shape != (expected, emb_dim)
             or not hidden_states.is_floating_point()
         ):
             raise ValueError(
-                f"fixed state must have floating shape (batch, {expected}, {emb_dim})"
+                f"native fixed state must have floating stream-major shape ({expected}, {emb_dim}); "
+                "use FixedMemoryQueryStack for per-sample (B,S,E) input"
             )
 
 

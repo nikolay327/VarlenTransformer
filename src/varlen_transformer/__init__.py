@@ -7,6 +7,11 @@ from .layout import FixedMemoryQueryLayout, PackedMemoryQueryLayout
 from .memory_query import MemoryQueryBlock
 from .mha import MHA
 from .mlp import MLP
+from .stack import (
+    FixedMemoryQueryStack,
+    pack_fixed_memory_query,
+    unpack_fixed_memory_query,
+)
 
 __all__ = [
     "Block",
@@ -18,4 +23,7 @@ __all__ = [
     "FixedMemoryQueryLayout",
     "PackedMemoryQueryLayout",
     "create_memory_query_block",
+    "FixedMemoryQueryStack",
+    "pack_fixed_memory_query",
+    "unpack_fixed_memory_query",
 ]

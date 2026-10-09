@@ -40,6 +40,8 @@ def _attention_options(configuration, training):
 class MemoryQueryBlock(nn.Module):
     """Return (new_mlp_branch, updated_residual), both BF16.
 
+    Both inputs and outputs use flat [all M; all V; all Q] storage (N_total,E),
+    for fixed and packed layouts. FixedMemoryQueryStack adapts per-sample input.
     The caller supplies M, one V per sample, and Q, and reuses the layout for
     every block. V/Q never feed back into memory or attend to each other. SA is
     always causal. V cross-attention is noncausal and reads only the x-prefix;
@@ -116,12 +118,22 @@ class MemoryQueryBlock(nn.Module):
         )
         sa_opts = _attention_options(sa.attn, self.training)
         if isinstance(layout, FixedMemoryQueryLayout):
-            am = flash_attn_qkvpacked_func(qkv, causal=True, **sa_opts)
+            am = flash_attn_qkvpacked_func(
+                qkv.view(
+                    layout.batch_size,
+                    layout.memory_length,
+                    3,
+                    sa.num_heads,
+                    sa.head_dim,
+                ),
+                causal=True,
+                **sa_opts,
+            )
         else:
             am = flash_attn_varlen_qkvpacked_func(
                 qkv, layout.cu_seqlens_m, layout.max_seqlen_m, causal=True, **sa_opts
             )
-        am = am.reshape(*hidden_states.shape[:-2], n, e)
+        am = am.reshape(n, e)
         q, kv, rca, *_ = mq_pre_ca(
             am,
             r0,
@@ -141,13 +153,22 @@ class MemoryQueryBlock(nn.Module):
             n,
         )
         ca_opts = _attention_options(ca.attn, self.training)
+        b = layout.batch_size
         if isinstance(layout, FixedMemoryQueryLayout):
+            fixed_kv = kv.view(b, layout.memory_length, 2, ca.num_heads, ca.head_dim)
             av = flash_attn_kvpacked_func(
-                q[:, :1], kv[:, : layout.x_prefix_length], causal=False, **ca_opts
+                q[:b].view(b, 1, ca.num_heads, ca.head_dim),
+                fixed_kv[:, : layout.x_prefix_length],
+                causal=False,
+                **ca_opts,
             )
-            aq = flash_attn_kvpacked_func(q[:, 1:], kv, causal=True, **ca_opts)
+            aq = flash_attn_kvpacked_func(
+                q[b:].view(b, layout.query_length, ca.num_heads, ca.head_dim),
+                fixed_kv,
+                causal=True,
+                **ca_opts,
+            )
         else:
-            b = layout.batch_size
             # Project Wkv once; compact only the projected x-prefix for V.
             prefix_kv = kv.index_select(0, layout.x_prefix_indices)
             av = flash_attn_varlen_kvpacked_func(
@@ -170,9 +191,13 @@ class MemoryQueryBlock(nn.Module):
                 causal=True,
                 **ca_opts,
             )
-        query_attn = torch.cat((av, aq), dim=-3).reshape(
-            *hidden_states.shape[:-2], hidden_states.shape[-2] - n, e
-        )
+        query_attn = torch.cat(
+            (
+                av.reshape(b, ca.num_heads, ca.head_dim),
+                aq.reshape(layout.num_query_tokens, ca.num_heads, ca.head_dim),
+            ),
+            dim=0,
+        ).reshape(hidden_states.shape[0] - n, e)
         branch, r1, *_ = mq_post_ca_mlp(
             query_attn,
             rca,
