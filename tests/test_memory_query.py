@@ -12,13 +12,9 @@ def inputs(packed, *, dtype=torch.float32, device="cpu", requires_grad=True):
     layout = (
         PackedMemoryQueryLayout.ncse([3, 2, 3], [3, 2, 4], device=device)
         if packed
-        else FixedMemoryQueryLayout.ncse(3, 4)
+        else FixedMemoryQueryLayout.ncse(3, 4, batch_size=2)
     )
-    shape = (
-        (layout.total_tokens, 16)
-        if packed
-        else (2, layout.memory_length + 1 + layout.query_length, 16)
-    )
+    shape = (layout.total_tokens, 16)
     x = torch.randn(shape, dtype=dtype, device=device, requires_grad=requires_grad)
     return x, layout
 
@@ -75,9 +71,9 @@ def test_stack_chaining_and_all_gradients(memory_reference_backend, packed):
 def test_fixed_dependency_graph_perturbations_and_input_jacobian(
     memory_reference_backend, depth
 ):
-    layout = FixedMemoryQueryLayout.ncse(3, 4)
+    layout = FixedMemoryQueryLayout.ncse(3, 4, batch_size=1)
     blocks = [MemoryQueryBlock(16, 32, 2).eval() for _ in range(depth)]
-    x = torch.randn(1, 11, 16, requires_grad=True)
+    x = torch.randn(11, 16, requires_grad=True)
 
     def run(value):
         h, r = value, None
@@ -87,31 +83,29 @@ def test_fixed_dependency_graph_perturbations_and_input_jacobian(
 
     actual = run(x)
     changed = x.detach().clone()
-    changed[:, 6:] *= 20
-    torch.testing.assert_close(actual[:, :6], run(changed)[:, :6], rtol=0, atol=0)
+    changed[6:] *= 20
+    torch.testing.assert_close(actual[:6], run(changed)[:6], rtol=0, atol=0)
     # No V -> Q, Q -> V, or Q -> Q path, even through stacked shared FFNs.
     for index in range(6, 11):
         changed = x.detach().clone()
-        changed[:, index] = torch.randn_like(changed[:, index]) * 10
+        changed[index] = torch.randn_like(changed[index]) * 10
         other = run(changed)
         keep = [i for i in range(11) if i != index]
-        torch.testing.assert_close(actual[:, keep], other[:, keep], rtol=0, atol=0)
+        torch.testing.assert_close(actual[keep], other[keep], rtol=0, atol=0)
     for j in range(4):
-        gx = torch.autograd.grad(actual[:, 7 + j].square().sum(), x, retain_graph=True)[
-            0
-        ]
-        assert torch.count_nonzero(gx[:, :3]) > 0
+        gx = torch.autograd.grad(actual[7 + j].square().sum(), x, retain_graph=True)[0]
+        assert torch.count_nonzero(gx[:3]) > 0
         if j:
-            assert torch.count_nonzero(gx[:, 3 : 3 + j]) > 0
-        assert torch.count_nonzero(gx[:, 3 + j : 6]) == 0
-        assert torch.count_nonzero(gx[:, 6 : 7 + j]) == 0
-        assert torch.count_nonzero(gx[:, 8 + j :]) == 0
-    gv = torch.autograd.grad(actual[:, 6].square().sum(), x)[0]
-    assert torch.count_nonzero(gv[:, :3]) > 0
-    assert torch.count_nonzero(gv[:, 3:6]) == torch.count_nonzero(gv[:, 7:]) == 0
+            assert torch.count_nonzero(gx[3 : 3 + j]) > 0
+        assert torch.count_nonzero(gx[3 + j : 6]) == 0
+        assert torch.count_nonzero(gx[6 : 7 + j]) == 0
+        assert torch.count_nonzero(gx[8 + j :]) == 0
+    gv = torch.autograd.grad(actual[6].square().sum(), x)[0]
+    assert torch.count_nonzero(gv[:3]) > 0
+    assert torch.count_nonzero(gv[3:6]) == torch.count_nonzero(gv[7:]) == 0
     changed = x.detach().clone()
-    changed[:, 3:6] *= 40
-    torch.testing.assert_close(actual[:, 6], run(changed)[:, 6], rtol=0, atol=0)
+    changed[3:6] *= 40
+    torch.testing.assert_close(actual[6], run(changed)[6], rtol=0, atol=0)
 
 
 def test_packed_isolation_prefix_gather_and_dependency_graph(memory_reference_backend):
@@ -149,17 +143,14 @@ def test_packed_isolation_prefix_gather_and_dependency_graph(memory_reference_ba
 def test_fixed_and_uniform_packed_equivalence_and_gradient_scatter(
     memory_reference_backend,
 ):
-    fixed = FixedMemoryQueryLayout.ncse(3, 4)
+    fixed = FixedMemoryQueryLayout.ncse(3, 4, batch_size=2)
     packed = PackedMemoryQueryLayout.ncse([3, 3], [4, 4])
     block = MemoryQueryBlock(16, 32, 2).eval()
     x = torch.randn(2, 11, 16, requires_grad=True)
     px = torch.cat((x[:, :6].flatten(0, 1), x[:, 6], x[:, 7:].flatten(0, 1)))
-    a, p = block(x, layout=fixed), block(px, layout=packed)
+    a, p = block(px, layout=fixed), block(px, layout=packed)
     for actual, other in zip(a, p):
-        repacked = torch.cat(
-            (actual[:, :6].flatten(0, 1), actual[:, 6], actual[:, 7:].flatten(0, 1))
-        )
-        torch.testing.assert_close(repacked, other, rtol=0, atol=0)
+        torch.testing.assert_close(actual, other, rtol=0, atol=0)
     ga = torch.autograd.grad(
         sum(t.float().square().sum() for t in a), x, retain_graph=True
     )[0]
@@ -351,7 +342,7 @@ def test_layout_indices_metadata_and_validation():
     assert layout.cu_seqlens_v.tolist() == [0, 1, 2, 3]
     assert layout.to("cpu").total_tokens == 26
     with pytest.raises(ValueError):
-        FixedMemoryQueryLayout(2, 2, 3)
+        FixedMemoryQueryLayout(2, 2, 3, batch_size=1)
     with pytest.raises(ValueError):
         PackedMemoryQueryLayout.from_lengths(torch.tensor([3]), [2], [1])
 
@@ -401,27 +392,14 @@ def test_invalid_block_configuration(memory_reference_backend, kwargs):
 
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("sm,d,t", [(3, 6, 2), (4, 4, 3), (7, 3, 4)])
-def test_general_rectangular_block_geometry(memory_reference_backend, packed, sm, d, t):
-    layout = (
-        PackedMemoryQueryLayout.from_lengths([sm, sm + 1], [d, max(1, d - 1)], [t, t])
-        if packed
-        else FixedMemoryQueryLayout(sm, d, t)
-    )
-    shape = (layout.total_tokens, 16) if packed else (2, sm + 1 + d, 16)
-    block = MemoryQueryBlock(16, 32, 2)
-    ref = copy.deepcopy(block)
-    x = torch.randn(shape, requires_grad=True)
-    ex = x.detach().clone().requires_grad_()
-    actual = block(x, layout=layout)
-    expected = memory_query_block_forward(ref, ex, None, layout)
-    for a, b in zip(actual, expected):
-        torch.testing.assert_close(a, b, rtol=0, atol=0)
-    gradient = tuple(torch.randn_like(t) / t.numel() ** 0.5 for t in actual)
-    assert_gradients(
-        torch.autograd.grad(actual, (x, *block.parameters()), gradient),
-        torch.autograd.grad(expected, (ex, *ref.parameters()), gradient),
-        relative_l2=0.04,
-    )
+def test_non_ncse_block_geometry_is_rejected(packed, sm, d, t):
+    with pytest.raises(ValueError, match="NCSE"):
+        if packed:
+            PackedMemoryQueryLayout.from_lengths(
+                [sm, sm + 1], [d, max(1, d - 1)], [t, t]
+            )
+        else:
+            FixedMemoryQueryLayout(sm, d, t, batch_size=1)
 
 
 @pytest.mark.parametrize(

@@ -43,3 +43,5 @@ venv/
 
 # legacy codes
 *_legacy.py
+# Local CUDA benchmark reports and optional profiler traces.
+benchmark-results/

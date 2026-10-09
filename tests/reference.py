@@ -285,7 +285,9 @@ def memory_query_block_forward(block, x, residual, layout):
             layer.bias.bfloat16(),
         ).reshape(*value.shape[:-1], layer.weight.shape[0])
 
-    packed = x.ndim == 2
+    from varlen_transformer.layout import PackedMemoryQueryLayout
+
+    packed = isinstance(layout, PackedMemoryQueryLayout)
     n = layout.num_memory_tokens
     h, r = (
         x.bfloat16(),
@@ -307,7 +309,16 @@ def memory_query_block_forward(block, x, residual, layout):
     am = (
         packed_attention(qkv, layout.cu_seqlens_m, layout.max_seqlen_m, **opts)
         if packed
-        else attention(qkv, **opts)
+        else attention(
+            qkv.view(
+                layout.batch_size,
+                layout.memory_length,
+                3,
+                mixer.num_heads,
+                mixer.head_dim,
+            ),
+            **opts,
+        )
     )
     m1 = m0 + linear(am.reshape_as(m0), mixer.out_proj)
     rca = torch.cat((m1, queries0), dim=-2)
@@ -323,10 +334,24 @@ def memory_query_block_forward(block, x, residual, layout):
         softmax_scale=cross.attn.softmax_scale, window_size=cross.attn.window_size
     )
     if not packed:
-        av = cross_attention(
-            q_all[:, :1], kv_m[:, : layout.x_prefix_length], causal=False, **opts
+        b = layout.batch_size
+        fixed_memory = kv_m.view(
+            b, layout.memory_length, 2, cross.num_heads, cross.head_dim
         )
-        aq = cross_attention(q_all[:, 1:], kv_m, causal=True, **opts)
+        av = cross_attention(
+            q_all[:b].view(b, 1, cross.num_heads, cross.head_dim),
+            fixed_memory[:, : layout.x_prefix_length],
+            causal=False,
+            **opts,
+        )
+        aq = cross_attention(
+            q_all[b:].view(b, layout.query_length, cross.num_heads, cross.head_dim),
+            fixed_memory,
+            causal=True,
+            **opts,
+        )
+        av = av.reshape(b, cross.num_heads, cross.head_dim)
+        aq = aq.reshape(layout.num_query_tokens, cross.num_heads, cross.head_dim)
     else:
         mo, qo, xo = (
             layout.cu_seqlens_m.tolist(),
@@ -359,6 +384,80 @@ def memory_query_block_forward(block, x, residual, layout):
     z = norm(r1, block.norm_mlp)
     branch = linear(F.gelu(linear(z, block.mlp.fc1), approximate="tanh"), block.mlp.fc2)
     return branch, r1
+
+
+def legacy_fixed_memory_query_reference(
+    block, x, residual, memory_length, x_prefix_length
+):
+    """Independent original per-sample equations, for refactor parity checks.
+
+    This oracle never packs the full state and never calls the native block or
+    package arithmetic helpers. Parameters are shared with the tested module.
+    """
+    assert not block.training or all(
+        p == 0
+        for p in (
+            block.dropout_input.p,
+            block.dropout_sa.p,
+            block.dropout_ca.p,
+            block.memory_mixer.attn.drop.p,
+            block.cross_mixer.attn.drop.p,
+        )
+    )
+
+    def norm(value, layer):
+        return F.layer_norm(
+            value.float(),
+            (value.shape[-1],),
+            layer.weight.float(),
+            layer.bias.float(),
+            layer.eps,
+        ).bfloat16()
+
+    def linear(value, layer):
+        return F.linear(
+            value.reshape(-1, value.shape[-1]),
+            layer.weight.bfloat16(),
+            layer.bias.bfloat16(),
+        ).reshape(*value.shape[:-1], layer.weight.shape[0])
+
+    b, _, e = x.shape
+    r0 = x.bfloat16() + (
+        torch.zeros_like(x, dtype=torch.bfloat16)
+        if residual is None
+        else residual.bfloat16()
+    )
+    m0, queries = r0[:, :memory_length], r0[:, memory_length:]
+    sa, ca = block.memory_mixer, block.cross_mixer
+    qkv = linear(norm(m0, block.norm_sa), sa.Wqkv).reshape(
+        b, memory_length, 3, sa.num_heads, sa.head_dim
+    )
+    am = attention(
+        qkv,
+        causal=True,
+        softmax_scale=sa.attn.softmax_scale,
+        window_size=sa.attn.window_size,
+    ).reshape(b, memory_length, e)
+    m1 = m0 + linear(am, sa.out_proj)
+    rca = torch.cat((m1, queries), dim=1)
+    normalized = norm(rca, block.norm_ca)
+    q = linear(normalized[:, memory_length:], ca.Wq).reshape(
+        b, queries.shape[1], ca.num_heads, ca.head_dim
+    )
+    kv = linear(normalized[:, :memory_length], ca.Wkv).reshape(
+        b, memory_length, 2, ca.num_heads, ca.head_dim
+    )
+    opts = dict(softmax_scale=ca.attn.softmax_scale, window_size=ca.attn.window_size)
+    av = cross_attention(q[:, :1], kv[:, :x_prefix_length], causal=False, **opts)
+    aq = cross_attention(q[:, 1:], kv, causal=True, **opts)
+    updated = queries + linear(
+        torch.cat((av, aq), dim=1).reshape_as(queries), ca.out_proj
+    )
+    r1 = torch.cat((m1, updated), dim=1)
+    z = norm(r1, block.norm_mlp)
+    return linear(
+        F.gelu(linear(z, block.mlp.fc1), approximate="tanh"), block.mlp.fc2
+    ), r1
 
 
 def pre_args(

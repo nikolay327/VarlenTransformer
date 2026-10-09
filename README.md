@@ -1,25 +1,26 @@
 # VarlenTransformer
 
-Pre-norm transformer blocks backed by [FlashAttention 2](https://github.com/Dao-AILab/flash-attention), with fixed-length batches and packed variable-length sequences. The package contains three distinct building blocks:
+Pre-norm transformer blocks built on [FlashAttention 2](https://github.com/Dao-AILab/flash-attention), supporting both fixed-length batches and packed variable-length sequences.
 
-- `Block`: a conventional transformer block with causal or bidirectional self-attention and an MLP.
-- `CrossMHA`: standalone cross-attention between separate query and key/value streams.
-- `MemoryQueryBlock`: a specialized architecture with causal memory self-attention, separate volume/density query routes, and a shared MLP.
+The package provides:
 
-The original `Block`, `MHA`, `MLP`, and `create_block` APIs remain available alongside the new components.
+- **`Block`** — a standard transformer block with causal or bidirectional self-attention and an MLP.
+- **`CrossMHA`** — multi-head cross-attention between separate query and key/value streams.
+- **`MemoryQueryBlock`** — causal memory self-attention followed by volume/density cross-attention and a shared MLP.
 
-## Requirements and installation
+`MHA`, `MLP`, and the corresponding block factories are also available as public components.
 
-Python 3.10+, PyTorch 2.8+, FlashAttention 2.6–2.x, and an NVIDIA GPU supporting BF16 (Ampere or newer) are required for real attention execution. CPU environments support the non-CUDA tests; the package does not include compiled extensions of its own.
+## Installation
 
-A preconfigured CUDA/PyTorch/FlashAttention environment supports an editable installation without dependency replacement:
+The attention backends require Python 3.10+, PyTorch 2.8+, FlashAttention 2.6–2.x, and an NVIDIA GPU with BF16 support (Ampere or newer). CPU execution is supported for the non-CUDA tests. This package contains no separately compiled CUDA extensions.
 
-```text
-python -m pip install "pytest>=8" "pytest-cov>=5" "build>=1.2" "hatchling>=1.27"
+For an environment with CUDA-enabled PyTorch and FlashAttention already installed:
+
+```bash
 python -m pip install -e . --no-deps
 ```
 
-For new environments, CUDA-enabled PyTorch is distributed through the [official PyTorch installation options](https://pytorch.org/get-started/locally/). The upstream FlashAttention package has its own CUDA and build requirements. Typical Linux installation commands are:
+For a new Linux environment, install a compatible CUDA-enabled PyTorch build from the [PyTorch installation guide](https://pytorch.org/get-started/locally/), followed by FlashAttention and the package:
 
 ```bash
 python -m pip install packaging psutil ninja
@@ -27,35 +28,35 @@ python -m pip install 'flash-attn>=2.6,<3' --no-build-isolation
 python -m pip install -e '.[test]'
 ```
 
-Editable installation uses Hatchling's normal build isolation. `--no-deps` leaves existing PyTorch and FlashAttention installations unchanged.
+## Self-attention transformer
 
-## Standard transformer block
-
-`create_block` builds the original pre-norm transformer with causal or bidirectional multi-head self-attention:
+`create_block` constructs a pre-norm transformer block with causal or bidirectional attention. Inputs are `(B, S, E)` for fixed-length batches or `(N, E)` for packed variable-length sequences.
 
 ```python
 import torch
 from varlen_transformer import create_block
 
 block = create_block(
-    emb_dim=128, intermediate_size=512, num_attention_heads=4,
-    causal=False,
+    emb_dim=128,
+    intermediate_size=512,
+    num_attention_heads=4,
+    causal=True,
 ).cuda()
 
 x = torch.randn(9, 128, device="cuda", requires_grad=True)
 cu_seqlens = torch.tensor([0, 2, 5, 9], device="cuda", dtype=torch.int32)
+
 h, residual = block(x, cu_seqlens=cu_seqlens, max_seqlen=4)
 y = h + residual
-y.float().square().mean().backward()
 ```
 
-Fixed batches have shape `(batch, seqlen, emb_dim)` and no sequence-offset arguments. Packed batches have shape `(total_tokens, emb_dim)`, with `cu_seqlens` delimiting nonempty samples and `max_seqlen` bounding their lengths. Offset values are trusted without synchronizing CUDA tensors to the host; int64 offsets are converted to contiguous int32.
+For fixed-length batches, `cu_seqlens` and `max_seqlen` are omitted. For packed batches, `cu_seqlens` marks the boundaries between nonempty sequences. Offset tensors are used without reading their values on the CPU; int64 offsets are converted to contiguous int32.
 
-Each block returns `(mlp_branch, residual_stream)`, both BF16. A block stack propagates both outputs via `h, residual = next_block(h, residual, ...)`. A final `h + residual` reconstructs the updated stream; a separate final normalization remains model-dependent. `MHA` is also available independently.
+A block returns `(mlp_branch, residual_stream)`, both BF16. Successive blocks pass both tensors forward, and `h + residual` reconstructs the output of the last block. Any final normalization belongs to the surrounding model.
 
-## Standalone cross-attention
+## Cross-attention
 
-`CrossMHA` projects its query stream and key/value stream separately. It is independent of the memory/query block and supports both noncausal and causal attention:
+`CrossMHA` uses separate projections for queries (`Wq`) and key/value inputs (`Wkv`), followed by an output projection. It supports noncausal and causal attention.
 
 ```python
 import torch
@@ -67,52 +68,88 @@ kv = torch.randn(2, 6, 128, device="cuda", dtype=torch.bfloat16)
 out = cross(q, kv)  # (2, 4, 128)
 ```
 
-Packed cross-attention accepts `q=(Tq, E)` and `kv=(Tk, E)` with four independent sequence arguments: `cu_seqlens_q`, `cu_seqlens_k`, `max_seqlen_q`, and `max_seqlen_k`. Both streams contain the same number of nonempty samples but may have different lengths. Causal rectangular masks follow FlashAttention's bottom-right alignment: query row `i` attends to key row `k` when `k <= i + Sk - Sq`. A fully masked row has zero attention contribution before the output projection.
+For packed inputs, queries `(N_q, E)` and keys/values `(N_k, E)` use separate `cu_seqlens_q`, `cu_seqlens_k`, `max_seqlen_q`, and `max_seqlen_k` metadata. Both streams contain the same number of samples, but their lengths may differ.
 
-Standalone `MHA` and `CrossMHA` follow ordinary PyTorch projection dtype rules (typically FP16/BF16 parameters and inputs, or CUDA autocast).
+For rectangular causal attention, FlashAttention uses bottom-right alignment. Query position `i` attends to key position `k` when `k <= i + S_k - S_q`. Fully masked rows have zero attention output before the learned output projection.
+
+Standalone `MHA` and `CrossMHA` use ordinary PyTorch projection dtype rules, unlike the explicitly BF16-compute block implementations.
 
 ## Memory/query transformer
 
-`MemoryQueryBlock` operates on three token regions per sample: memory `M`, one externally supplied volume query `V`, and density queries `Q`.
+`MemoryQueryBlock` maintains three token regions:
 
-- Memory receives **causal self-attention**.
-- Volume attends **noncausally** to the `x`-prefix of contextualized memory.
-- Density attends **causally** to the full contextualized memory.
-- Volume and density share the same cross-attention projections. Neither query region attends to the other or feeds back into memory through attention.
-- A single shared tokenwise MLP follows these attention paths.
+- **Memory (`M`)** undergoes causal self-attention.
+- **Volume query (`V`)** attends to the contextualized observation (`x`) prefix of memory, using noncausal cross-attention.
+- **Density queries (`Q`)** attend to contextualized memory using rectangular causal cross-attention.
 
-`MemoryQueryBlock` is a specialized block rather than a replacement for general-purpose `CrossMHA`.
+Volume and density queries share the same cross-attention projections. They do not attend to each other and cannot update memory. After the attention operations, a single LayerNorm and MLP are shared by all three token regions.
 
-### Fixed-length memory/query layout
+The layout enforces the autoregressive geometry
 
-Each sample contains `[M; V; Q]` with shape `(batch, memory_length + 1 + query_length, emb_dim)`. The `ncse` convenience constructor sets `memory_length = x_prefix_length + query_length - 1`:
+$$
+S_M = S_x + S_Q - 1
+$$
+
+where `S_x` is the length of the observation prefix and `S_Q` is the number of density queries. Density query `j` can therefore attend to the observation prefix and only the preceding `j - 1` conditioning tokens.
+
+### Native stream-major layout
+
+Both fixed and packed `MemoryQueryBlock` calls use a flat `(N_total, E)` state with the token ordering
+
+```text
+[all memory tokens; all volume queries; all density queries]
+```
+
+The branch and residual streams share this layout across the entire block stack. Fixed-length attention uses views of the contiguous regions and the regular fixed-length FlashAttention kernels; variable-length attention uses packed kernels and sequence offsets.
+
+For a fixed batch, the layout specifies the batch size explicitly:
 
 ```python
 import torch
 from varlen_transformer import FixedMemoryQueryLayout, create_memory_query_block
 
-layout = FixedMemoryQueryLayout.ncse(x_prefix_length=3, query_length=4)
+layout = FixedMemoryQueryLayout.ncse(
+    x_prefix_length=3, query_length=4, batch_size=2
+)
 blocks = torch.nn.ModuleList([
     create_memory_query_block(128, 512, 4).cuda() for _ in range(2)
 ])
-h = torch.randn(2, 11, 128, device="cuda", requires_grad=True)
+
+h = torch.randn(layout.total_tokens, 128, device="cuda", requires_grad=True)
 residual = None
 for block in blocks:
     h, residual = block(h, residual, layout=layout)
 y = h + residual
 ```
 
-For other geometries, `FixedMemoryQueryLayout(memory_length, query_length, x_prefix_length)` specifies the independent lengths.
+`FixedMemoryQueryLayout(memory_length, query_length, x_prefix_length, batch_size=B)` provides the equivalent explicit constructor. Incompatible autoregressive lengths are rejected. `CrossMHA` remains available for general rectangular attention without this constraint.
 
-### Packed memory/query layout
+### Fixed-batch stack adapter
 
-Packed state has shape `(total_tokens, E)` and stores the concatenated regions as `[all M; all V; all Q]`, rather than interleaving samples. The layout tracks sample offsets and the selected memory prefixes. The same layout can be reused across a stack of blocks.
+`FixedMemoryQueryStack` accepts the per-sample `(B, S_M + 1 + S_Q, E)` layout, ordered `[M; V; Q]` within each sample. It converts both streams to stream-major form at stack entry and back at stack exit, rather than converting between every block.
+
+```python
+from varlen_transformer import FixedMemoryQueryStack
+
+stack = FixedMemoryQueryStack(blocks)
+x = torch.randn(2, 11, 128, device="cuda", requires_grad=True)
+h, residual = stack(x, layout=layout)
+y = h + residual  # (2, 11, 128)
+```
+
+The adapter preserves gradients through layout conversion. `return_stream_major=True` returns flat states. `pack_fixed_memory_query` and `unpack_fixed_memory_query` expose the conversions separately.
+
+### Packed variable-length layout
+
+`PackedMemoryQueryLayout` describes heterogeneous memory, observation-prefix, and density-query lengths with reusable metadata. The flat state uses the same stream-major ordering as the fixed native block.
 
 ```python
 from varlen_transformer import PackedMemoryQueryLayout
 
 layout = PackedMemoryQueryLayout.ncse(
-    x_prefix_lengths=[3, 2], query_lengths=[4, 2], device="cuda"
+    x_prefix_lengths=[3, 2],
+    query_lengths=[4, 2],
+    device="cuda",
 )
 h = torch.randn(layout.total_tokens, 128, device="cuda", requires_grad=True)
 residual = None
@@ -121,27 +158,75 @@ for block in blocks:
 y = h + residual
 ```
 
-In this example, the memory lengths are `[6, 3]`; the packed state contains 9 memory tokens, 2 volume tokens and 6 density tokens, totaling 17. General layouts are available through `PackedMemoryQueryLayout.from_lengths(memory_lengths, query_lengths, x_prefix_lengths, device=...)`. The direct packed-layout constructor also supports existing device-side metadata. Layout tensors and state tensors occupy the same device; `.to(device)` produces a device-local layout.
+Here the two memory lengths are 6 and 3, giving 9 memory tokens, 2 volume queries, and 6 density queries.
 
-### Precision and limitations
+`PackedMemoryQueryLayout.from_lengths(...)` constructs and verifies the per-sample autoregressive geometry from host-side sequence lengths. Direct construction with precomputed CPU metadata validates its values. Device-resident precomputed metadata uses `trust_metadata=True`; in that case the caller is responsible for correct offsets, prefix indices, and per-sample lengths. Layouts can be transferred with `.to(device)`.
 
-Both memory/query block outputs are BF16. Internal linear operations, residual updates, dropout, attention and GELU use BF16; LayerNorm arithmetic and parameter-gradient accumulation use FP32. The custom autograd regions support first-order gradients, but not double backward.
+Attention masks constrain which memory tokens each query can read. The caller-provided initial query embeddings must also be free of target or future conditioning values for the autoregressive dependency to hold.
 
-The memory/query block makes three FlashAttention calls per layer (memory self-attention, volume cross-attention, density cross-attention). Empty memory, prefix and query sequences are not supported. A full-block compilation guarantee and performance benchmark are not implied by custom-operator compilation tests.
+### Precision and gradients
 
-## Tests and continuous integration
+The block accepts floating-point input and parameter storage dtypes and computes its attention, linear operations, residual updates, dropout, and GELU in BF16. LayerNorm arithmetic and parameter-gradient accumulation use FP32. Outputs are BF16, and the custom backward supports first-order derivatives only.
 
-The test suite covers the original transformer, standalone cross-attention, custom operators, memory/query layouts and blocks, package builds, and CUDA attention integration. CPU tests substitute reference attention where appropriate while preserving the actual custom operators. CUDA tests exercise FlashAttention itself.
+Each block invokes FlashAttention three times: memory self-attention, volume cross-attention, and density cross-attention. The K/V projection is shared between the two cross-attention paths.
 
-```text
+## Testing
+
+The tests cover the standard block, cross-attention, mixed-precision custom operations, memory/query layouts, dependency isolation, packing, gradients, and real CUDA integration.
+
+```bash
 python -m pytest -m "not cuda"
 python -m pytest -m cuda --require-cuda
 python -m pytest --require-cuda
 ```
 
-The `--require-cuda` option turns unavailable or incompatible CUDA/FlashAttention prerequisites into a test error rather than a skipped GPU suite. Numerical correctness tests are not performance benchmarks.
+`--require-cuda` fails when the required GPU or FlashAttention environment is unavailable, rather than silently skipping CUDA tests. GitHub Actions runs CPU tests automatically; the GPU workflow is manually triggered on a compatible self-hosted runner.
 
-GitHub Actions contains automated CPU checks and an optional, manually triggered GPU workflow. The GPU workflow uses a self-hosted runner with the `gpu` label and an installed PyTorch/FlashAttention environment. Its operating-system label is defined in `.github/workflows/gpu-tests.yml`.
+## Local CUDA benchmarking and visualization
+
+`benchmarks/profile_memory_query.py` benchmarks inference and forward/backward
+training using CUDA events. It reports median and p10/p90 latency, throughput,
+GPU memory allocation, and hardware/software metadata. Setup and initialization
+are excluded from timings; training includes backward but not optimizer steps.
+
+Examples from the repository root:
+
+```bash
+python benchmarks/profile_memory_query.py \
+  --implementation native --layout fixed --depth 4 \
+  --output benchmark-results/native-fixed
+
+python benchmarks/profile_memory_query.py \
+  --implementation wrapper --layout fixed --depth 4 --mode train \
+  --output benchmark-results/wrapper-train
+
+python benchmarks/profile_memory_query.py \
+  --layout packed --batch-size 3 \
+  --memory-lengths 7,31,127 --query-lengths 3,4,5 \
+  --output benchmark-results/packed
+```
+
+Native fixed-layout measurements separate the flat core from adapter-inclusive
+execution. Each output directory contains `report.json` and `report.csv`.
+
+To create PNG charts from a report, install the optional plotting dependency
+(`python -m pip install ".[viz]"`) and run:
+
+```bash
+python benchmarks/visualize_memory_query.py benchmark-results/native-fixed/report.json
+```
+
+The visualizer plots latency with p10/p90 ranges, throughput, and peak allocated
+GPU memory. Reports with baseline comparisons also produce speedup and absolute
+latency-comparison charts. Images are saved next to the report unless `--output`
+specifies another directory.
+
+For before/after measurements, the driver supports `--implementation legacy`
+with `--source-root` pointing to a separate checkout at its recorded baseline
+commit, and `--baseline-json` when measuring the revised implementation.
+Comparisons require compatible hardware, software, and workload configurations.
+Use `--help` for all options or `--trace PATH` for an optional Chrome trace.
+The generated data and traces are not committed or used as CI test thresholds.
 
 ## AI use
 
@@ -149,4 +234,4 @@ AI assistance was used during the development of this package.
 
 ## License
 
-[MIT](LICENSE). Third-party license information for PyTorch and FlashAttention is recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+[MIT](LICENSE). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for third-party license information.

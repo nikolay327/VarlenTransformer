@@ -183,13 +183,9 @@ def _block_inputs(packed, dtype=torch.float32):
     layout = (
         PackedMemoryQueryLayout.ncse([1, 7, 3], [1, 4, 6], device="cuda")
         if packed
-        else FixedMemoryQueryLayout.ncse(7, 5)
+        else FixedMemoryQueryLayout.ncse(7, 5, batch_size=2)
     )
-    shape = (
-        (layout.total_tokens, 32)
-        if packed
-        else (2, layout.memory_length + 1 + layout.query_length, 32)
-    )
+    shape = (layout.total_tokens, 32)
     return torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True), layout
 
 
@@ -307,41 +303,30 @@ def test_real_packed_and_fixed_graph_has_no_forbidden_paths(packed):
             layout.cu_seqlens_q.tolist(),
             layout.cu_seqlens_x.tolist(),
         )
-        for s in range(layout.batch_size):
-            xv = xo[s + 1] - xo[s]
-            gv = torch.autograd.grad(
-                baseline[n + s].square().sum(), x, retain_graph=True
-            )[0]
-            allowed = list(range(mo[s], mo[s] + xv)) + [n + s]
+        xl = [b - a for a, b in zip(xo, xo[1:])]
+    else:
+        mo = [i * layout.memory_length for i in range(layout.batch_size + 1)]
+        qo = [i * layout.query_length for i in range(layout.batch_size + 1)]
+        xl = [layout.x_prefix_length] * layout.batch_size
+    for s in range(layout.batch_size):
+        gv = torch.autograd.grad(baseline[n + s].square().sum(), x, retain_graph=True)[
+            0
+        ]
+        allowed = list(range(mo[s], mo[s] + xl[s])) + [n + s]
+        assert (
+            torch.count_nonzero(gv[[i for i in range(len(x)) if i not in allowed]]) == 0
+        )
+        assert torch.count_nonzero(gv[mo[s] : mo[s] + xl[s]]) > 0
+        for j in range(qo[s + 1] - qo[s]):
+            qi = n + layout.batch_size + qo[s] + j
+            gx = torch.autograd.grad(baseline[qi].square().sum(), x, retain_graph=True)[
+                0
+            ]
+            allowed = list(range(mo[s], mo[s] + xl[s] + j)) + [qi]
             assert (
-                torch.count_nonzero(gv[[i for i in range(len(x)) if i not in allowed]])
+                torch.count_nonzero(gx[[i for i in range(len(x)) if i not in allowed]])
                 == 0
             )
-            assert torch.count_nonzero(gv[mo[s] : mo[s] + xv]) > 0
-            for j in range(qo[s + 1] - qo[s]):
-                qi = n + layout.batch_size + qo[s] + j
-                gx = torch.autograd.grad(
-                    baseline[qi].square().sum(), x, retain_graph=True
-                )[0]
-                allowed = list(range(mo[s], mo[s] + xv + j)) + [qi]
-                assert (
-                    torch.count_nonzero(
-                        gx[[i for i in range(len(x)) if i not in allowed]]
-                    )
-                    == 0
-                )
-    else:
-        for j in range(layout.query_length):
-            gx = torch.autograd.grad(
-                baseline[:, n + 1 + j].square().sum(), x, retain_graph=True
-            )[0]
-            assert torch.count_nonzero(gx[:, layout.x_prefix_length + j : n]) == 0
-            assert torch.count_nonzero(gx[:, n : n + 1 + j]) == 0
-            assert torch.count_nonzero(gx[:, n + 2 + j :]) == 0
-        gv = torch.autograd.grad(baseline[:, n].square().sum(), x)[0]
-        assert torch.count_nonzero(gv[:, layout.x_prefix_length : n]) == 0
-        assert torch.count_nonzero(gv[:, n + 1 :]) == 0
-        assert torch.count_nonzero(gv[:, : layout.x_prefix_length]) > 0
 
 
 def test_real_cross_dropout_eval_and_sequence_isolation():
@@ -400,9 +385,9 @@ def test_real_memory_query_block_at_memory_tile_boundaries(memory_length, packed
     layout = (
         PackedMemoryQueryLayout.ncse([t, 1], [d, 1], device="cuda")
         if packed
-        else FixedMemoryQueryLayout.ncse(t, d)
+        else FixedMemoryQueryLayout.ncse(t, d, batch_size=1)
     )
-    shape = (layout.total_tokens, 16) if packed else (1, memory_length + 1 + d, 16)
+    shape = (layout.total_tokens, 16)
     block = MemoryQueryBlock(16, 32, 2).cuda()
     ref = copy.deepcopy(block)
     x = torch.randn(shape, device="cuda", requires_grad=True)
@@ -420,17 +405,14 @@ def test_real_memory_query_block_at_memory_tile_boundaries(memory_length, packed
 
 
 def test_real_fixed_and_uniform_packed_equivalence_and_input_gradients():
-    fixed = FixedMemoryQueryLayout.ncse(3, 4)
+    fixed = FixedMemoryQueryLayout.ncse(3, 4, batch_size=2)
     packed = PackedMemoryQueryLayout.ncse([3, 3], [4, 4], device="cuda")
     block = MemoryQueryBlock(32, 64, 2).cuda().eval()
     x = torch.randn(2, 11, 32, device="cuda", requires_grad=True)
     px = torch.cat((x[:, :6].flatten(0, 1), x[:, 6], x[:, 7:].flatten(0, 1)))
-    a, p = block(x, layout=fixed), block(px, layout=packed)
+    a, p = block(px, layout=fixed), block(px, layout=packed)
     for actual, other in zip(a, p):
-        repacked = torch.cat(
-            (actual[:, :6].flatten(0, 1), actual[:, 6], actual[:, 7:].flatten(0, 1))
-        )
-        torch.testing.assert_close(repacked, other, rtol=0.025, atol=0.015)
+        torch.testing.assert_close(actual, other, rtol=0.025, atol=0.015)
     ga = torch.autograd.grad(
         sum(t.float().square().mean() for t in a), x, retain_graph=True
     )[0]
