@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "VarlenTransformer"
-version = "0.1.0"
+version = "0.2.0"
 description = "BF16 transformer blocks for packed variable-length and fixed-length FlashAttention"
 readme = "README.md"
 license = "MIT"
@@ -30,7 +30,7 @@ exclude = ["**/__pycache__", "**/*.pyc", "**/*.pyo", ".pytest_cache", ".coverage
 packages = ["src/varlen_transformer"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/.github", "/README.md", "/TESTING.md", "/LICENSE", "/THIRD_PARTY_NOTICES.md", "/pyproject.toml"]
+include = ["/src", "/tests", "/.github", "/README.md", "/LICENSE", "/THIRD_PARTY_NOTICES.md", "/pyproject.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

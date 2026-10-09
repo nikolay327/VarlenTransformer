@@ -8,8 +8,8 @@ permissions:
 
 jobs:
   gpu-tests:
-    # Register a dedicated Linux NVIDIA runner and add the custom `gpu` label.
-    runs-on: [self-hosted, linux, x64, gpu]
+    # Self-hosted Windows x64 runner with the custom `gpu` label.
+    runs-on: [self-hosted, windows, x64, gpu]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -24,7 +24,7 @@ jobs:
       - name: Install tests without replacing the CUDA dependencies
         run: |
           python -m pip install 'pytest>=8' 'pytest-cov>=5' 'build>=1.2' 'hatchling>=1.27'
-          python -m pip install -e . --no-deps --no-build-isolation
+          python -m pip install -e . --no-deps
       - name: Run both suites with the real CUDA backend required
         run: python -m pytest --require-cuda --junitxml=gpu-test-results.xml
       - name: Upload report
