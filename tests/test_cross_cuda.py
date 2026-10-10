@@ -76,7 +76,7 @@ def test_real_cross_mha_forward_input_and_every_parameter_gradient(
 
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("t,d", [(1, 1), (3, 4), (7, 2)])
-def test_native_ncse_causal_alignment_and_exact_input_dependencies(packed, t, d):
+def test_native_autoregressive_causal_alignment_and_exact_input_dependencies(packed, t, d):
     from flash_attn import flash_attn_kvpacked_func, flash_attn_varlen_kvpacked_func
 
     sk = t + d - 1
@@ -181,9 +181,9 @@ def test_varlen_cross_tiling_boundaries_and_all_gradients(d, causal):
 
 def _block_inputs(packed, dtype=torch.float32):
     layout = (
-        PackedMemoryQueryLayout.ncse([1, 7, 3], [1, 4, 6], device="cuda")
+        PackedMemoryQueryLayout.autoregressive([1, 7, 3], [1, 4, 6], device="cuda")
         if packed
-        else FixedMemoryQueryLayout.ncse(7, 5, batch_size=2)
+        else FixedMemoryQueryLayout.autoregressive(7, 5, batch_size=2)
     )
     shape = (layout.total_tokens, 32)
     return torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True), layout
@@ -383,9 +383,9 @@ def test_real_memory_query_block_at_memory_tile_boundaries(memory_length, packed
     d = min(4, memory_length)
     t = memory_length - d + 1
     layout = (
-        PackedMemoryQueryLayout.ncse([t, 1], [d, 1], device="cuda")
+        PackedMemoryQueryLayout.autoregressive([t, 1], [d, 1], device="cuda")
         if packed
-        else FixedMemoryQueryLayout.ncse(t, d, batch_size=1)
+        else FixedMemoryQueryLayout.autoregressive(t, d, batch_size=1)
     )
     shape = (layout.total_tokens, 16)
     block = MemoryQueryBlock(16, 32, 2).cuda()
@@ -405,8 +405,8 @@ def test_real_memory_query_block_at_memory_tile_boundaries(memory_length, packed
 
 
 def test_real_fixed_and_uniform_packed_equivalence_and_input_gradients():
-    fixed = FixedMemoryQueryLayout.ncse(3, 4, batch_size=2)
-    packed = PackedMemoryQueryLayout.ncse([3, 3], [4, 4], device="cuda")
+    fixed = FixedMemoryQueryLayout.autoregressive(3, 4, batch_size=2)
+    packed = PackedMemoryQueryLayout.autoregressive([3, 3], [4, 4], device="cuda")
     block = MemoryQueryBlock(32, 64, 2).cuda().eval()
     x = torch.randn(2, 11, 32, device="cuda", requires_grad=True)
     px = torch.cat((x[:, :6].flatten(0, 1), x[:, 6], x[:, 7:].flatten(0, 1)))

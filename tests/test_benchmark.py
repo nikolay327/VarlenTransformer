@@ -340,7 +340,7 @@ def test_native_and_wrapper_benchmark_workloads_agree(memory_reference_backend, 
     cleanup()
     end_to_end = cases[1][1]()
     cleanup()
-    layout = vt.FixedMemoryQueryLayout.ncse(2, 3, batch_size=2)
+    layout = vt.FixedMemoryQueryLayout.autoregressive(2, 3, batch_size=2)
     for flat, per_sample in zip(core, end_to_end):
         torch.testing.assert_close(
             flat, vt.pack_fixed_memory_query(per_sample, layout), rtol=0, atol=0

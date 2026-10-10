@@ -14,7 +14,7 @@ from varlen_transformer import (
 
 
 def test_conversion_roundtrip_and_gradients():
-    layout = FixedMemoryQueryLayout.ncse(3, 4, batch_size=2)
+    layout = FixedMemoryQueryLayout.autoregressive(3, 4, batch_size=2)
     x = torch.randn(2, 11, 16, requires_grad=True)
     flat = pack_fixed_memory_query(x, layout)
     expected = torch.cat((x[:, :6].reshape(12, 16), x[:, 6], x[:, 7:].reshape(8, 16)))
@@ -29,7 +29,7 @@ def test_conversion_roundtrip_and_gradients():
 def test_stack_adapter_matches_independent_native_reference(
     memory_reference_backend, with_residual
 ):
-    layout = FixedMemoryQueryLayout.ncse(3, 4, batch_size=2)
+    layout = FixedMemoryQueryLayout.autoregressive(3, 4, batch_size=2)
     adapter = FixedMemoryQueryStack([MemoryQueryBlock(16, 32, 2) for _ in range(3)])
     refs = copy.deepcopy(adapter.blocks)
     x = torch.randn(2, 11, 16, requires_grad=True)
@@ -70,10 +70,10 @@ def test_stack_adapter_matches_independent_native_reference(
     )
 
 
-def test_native_rejects_legacy_shape_and_wrapper_can_return_flat(
+def test_native_rejects_per_sample_shape_and_wrapper_can_return_flat(
     memory_reference_backend,
 ):
-    layout = FixedMemoryQueryLayout.ncse(3, 4, batch_size=2)
+    layout = FixedMemoryQueryLayout.autoregressive(3, 4, batch_size=2)
     block = MemoryQueryBlock(16, 32, 2)
     x = torch.randn(2, 11, 16)
     with pytest.raises(ValueError, match="FixedMemoryQueryStack"):

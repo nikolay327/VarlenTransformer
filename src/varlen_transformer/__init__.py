@@ -1,7 +1,7 @@
 """Transformer blocks using FlashAttention's packed and variable-length kernels."""
 
 from .block import Block
-from .cls import create_block, create_memory_query_block
+from .factories import create_block, create_memory_query_block
 from .cross_mha import CrossMHA
 from .layout import FixedMemoryQueryLayout, PackedMemoryQueryLayout
 from .memory_query import MemoryQueryBlock

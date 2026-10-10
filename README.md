@@ -108,7 +108,7 @@ For a fixed batch, the layout specifies the batch size explicitly:
 import torch
 from varlen_transformer import FixedMemoryQueryLayout, create_memory_query_block
 
-layout = FixedMemoryQueryLayout.ncse(
+layout = FixedMemoryQueryLayout.autoregressive(
     x_prefix_length=3, query_length=4, batch_size=2
 )
 blocks = torch.nn.ModuleList([
@@ -146,7 +146,7 @@ The adapter preserves gradients through layout conversion. `return_stream_major=
 ```python
 from varlen_transformer import PackedMemoryQueryLayout
 
-layout = PackedMemoryQueryLayout.ncse(
+layout = PackedMemoryQueryLayout.autoregressive(
     x_prefix_lengths=[3, 2],
     query_lengths=[4, 2],
     device="cuda",

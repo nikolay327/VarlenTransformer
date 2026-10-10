@@ -9,6 +9,28 @@ from torch import nn
 from torch.nn import functional as F
 
 
+class EagerBlockReference(nn.Module):
+    """Pre-norm block using ordinary module dtype rules and eager autograd."""
+
+    def __init__(self, emb_dim, mixer_cls, mlp_cls, resid_dropout1, resid_dropout2):
+        super().__init__()
+        self.mixer = mixer_cls(emb_dim)
+        self.mlp = mlp_cls(emb_dim)
+        self.norm_attn = nn.LayerNorm(emb_dim)
+        self.norm_mlp = nn.LayerNorm(emb_dim)
+        self.dropout1 = nn.Dropout(resid_dropout1)
+        self.dropout2 = nn.Dropout(resid_dropout2)
+
+    def forward(self, hidden_states, residual=None, cu_seqlens=None, max_seqlen=None):
+        dropped = self.dropout1(hidden_states)
+        residual = residual + dropped if residual is not None else dropped
+        hidden_states = self.norm_attn(residual)
+        hidden_states = self.mixer(hidden_states, cu_seqlens, max_seqlen)
+        residual = residual + self.dropout2(hidden_states)
+        hidden_states = self.mlp(self.norm_mlp(residual))
+        return hidden_states, residual
+
+
 def attention(
     qkv, *, causal=False, dropout_p=0.0, softmax_scale=None, window_size=(-1, -1), **_
 ):
@@ -386,7 +408,7 @@ def memory_query_block_forward(block, x, residual, layout):
     return branch, r1
 
 
-def legacy_fixed_memory_query_reference(
+def fixed_memory_query_reference(
     block, x, residual, memory_length, x_prefix_length
 ):
     """Independent original per-sample equations, for refactor parity checks.

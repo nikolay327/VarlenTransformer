@@ -34,7 +34,7 @@ def test_wheel_contains_importable_modules_and_license_metadata(distributions):
         for module in (
             "__init__",
             "block",
-            "cls",
+            "factories",
             "mha",
             "mlp",
             "_validation",
@@ -45,6 +45,7 @@ def test_wheel_contains_importable_modules_and_license_metadata(distributions):
             "_memory_ops",
         ):
             assert f"varlen_transformer/{module}.py" in names
+        assert "varlen_transformer/cls.py" not in names
         assert not any("/kernels/" in name or "__pycache__" in name for name in names)
         metadata = email.message_from_bytes(
             archive.read(

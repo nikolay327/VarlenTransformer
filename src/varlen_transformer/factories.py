@@ -1,3 +1,5 @@
+"""Factories for configured self-attention and memory/query blocks."""
+
 from functools import partial
 
 from .block import Block
@@ -6,13 +8,13 @@ from .mlp import MLP
 from .memory_query import MemoryQueryBlock
 
 
-def _create_mha_cls(num_attention_heads: int, attn_dropout: float, causal: bool):
+def _mha_factory(num_attention_heads: int, attn_dropout: float, causal: bool):
     return partial(
         MHA, num_heads=num_attention_heads, attn_dropout=attn_dropout, causal=causal
     )
 
 
-def _create_mlp_cls(intermediate_size: int):
+def _mlp_factory(intermediate_size: int):
     return partial(MLP, hidden_dim=intermediate_size)
 
 
@@ -26,12 +28,12 @@ def create_block(
     causal: bool = False,
 ) -> Block:
     """Create a BF16 block; use ``causal=True`` for autoregressive attention."""
-    mixer_cls = _create_mha_cls(
+    mixer_cls = _mha_factory(
         num_attention_heads=num_attention_heads,
         attn_dropout=0.0 if attn_dropout is None else attn_dropout,
         causal=causal,
     )
-    mlp_cls = _create_mlp_cls(intermediate_size)
+    mlp_cls = _mlp_factory(intermediate_size)
 
     return Block(
         emb_dim=emb_dim,

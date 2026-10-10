@@ -1,12 +1,8 @@
-"""Three first-order BF16/FP32 regions surrounding SA and the two CA calls.
+"""Custom autograd regions for memory self-attention, cross-attention, and MLP.
 
-All public outputs own storage. Saved norm statistics/intermediates are exposed
-only for autograd registration and testing, and are nondifferentiable.
-
-The native block supplies one flat stream-major token matrix. memory_tokens is
-the total memory span for the entire batch, so every projection/norm operates
-on a contiguous region rather than strided per-sample slices. The arithmetic
-helpers also accept leading batch dimensions for direct operator tests.
+The token axis contains memory followed by volume and density queries.
+memory_tokens is the total memory span across the batch. Auxiliary outputs
+hold the nondifferentiable statistics and intermediates saved for backward.
 """
 
 import torch
@@ -50,7 +46,7 @@ def _finish(grads, tensors, scalar_count):
 
 
 @torch.library.custom_op(
-    "legendblock::mq_pre_sa", mutates_args=(), device_types=("cpu", "cuda")
+    "varlen_transformer::mq_pre_sa", mutates_args=(), device_types=("cpu", "cuda")
 )
 def mq_pre_sa(
     hidden: Tensor,
@@ -138,7 +134,7 @@ mq_pre_sa.register_autograd(_sa_backward, setup_context=_sa_context)
 
 
 @torch.library.custom_op(
-    "legendblock::mq_pre_ca", mutates_args=(), device_types=("cpu", "cuda")
+    "varlen_transformer::mq_pre_ca", mutates_args=(), device_types=("cpu", "cuda")
 )
 def mq_pre_ca(
     attn_memory: Tensor,
@@ -245,7 +241,7 @@ mq_pre_ca.register_autograd(_ca_backward, setup_context=_ca_context)
 
 
 @torch.library.custom_op(
-    "legendblock::mq_post_ca_mlp", mutates_args=(), device_types=("cpu", "cuda")
+    "varlen_transformer::mq_post_ca_mlp", mutates_args=(), device_types=("cpu", "cuda")
 )
 def mq_post_ca_mlp(
     attn_queries: Tensor,

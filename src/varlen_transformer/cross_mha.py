@@ -21,7 +21,7 @@ class CrossMHA(nn.Module):
     Fixed inputs: q=(B,Sq,E), kv=(B,Sk,E). Packed inputs: q=(Tq,E),
     kv=(Tk,E), plus all four sequence arguments. Causal masking uses the
     native bottom-right alignment, including zero attention for fully masked
-    rows when Sq>Sk. Offset contents are a caller contract; no host sync occurs.
+    rows when Sq>Sk.
     """
 
     def __init__(

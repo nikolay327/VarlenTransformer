@@ -6,7 +6,7 @@ import torch
 from tests.reference import (
     assert_gradients,
     memory_query_block_forward,
-    legacy_fixed_memory_query_reference,
+    fixed_memory_query_reference,
 )
 from varlen_transformer import (
     FixedMemoryQueryLayout,
@@ -20,9 +20,9 @@ from varlen_transformer import (
 
 def layout_for(packed):
     return (
-        PackedMemoryQueryLayout.ncse([1, 3, 2], [1, 4, 2])
+        PackedMemoryQueryLayout.autoregressive([1, 3, 2], [1, 4, 2])
         if packed
-        else FixedMemoryQueryLayout.ncse(3, 4, batch_size=2)
+        else FixedMemoryQueryLayout.autoregressive(3, 4, batch_size=2)
     )
 
 
@@ -81,7 +81,7 @@ def test_mixed_precision_native_stacks_every_gradient(
 def test_adapter_preserves_original_per_sample_equations(
     memory_reference_backend, depth
 ):
-    layout = FixedMemoryQueryLayout.ncse(3, 4, batch_size=2)
+    layout = FixedMemoryQueryLayout.autoregressive(3, 4, batch_size=2)
     adapter = FixedMemoryQueryStack([MemoryQueryBlock(16, 32, 2) for _ in range(depth)])
     refs = copy.deepcopy(adapter.blocks)
     x = torch.randn(2, 11, 16, requires_grad=True)
@@ -89,7 +89,7 @@ def test_adapter_preserves_original_per_sample_equations(
     ex, er = x.detach().clone().requires_grad_(), r.detach().clone().requires_grad_()
     h, residual = ex, er
     for ref in refs:
-        h, residual = legacy_fixed_memory_query_reference(ref, h, residual, 6, 3)
+        h, residual = fixed_memory_query_reference(ref, h, residual, 6, 3)
     actual, expected = adapter(x, r, layout=layout), (h, residual)
     for a, e in zip(actual, expected):
         torch.testing.assert_close(a, e, rtol=0, atol=0)
@@ -265,7 +265,7 @@ def test_adapter_converts_only_at_stack_boundaries(
 ):
     import varlen_transformer.stack as adapter
 
-    layout = FixedMemoryQueryLayout.ncse(3, 4, batch_size=2)
+    layout = FixedMemoryQueryLayout.autoregressive(3, 4, batch_size=2)
     stack = FixedMemoryQueryStack([MemoryQueryBlock(16, 32, 2) for _ in range(depth)])
     pack, unpack = adapter.pack_fixed_memory_query, adapter.unpack_fixed_memory_query
     calls = []
@@ -318,7 +318,7 @@ def test_noncontiguous_states_and_frozen_parameters(memory_reference_backend, pa
 def test_adapter_dropout_serialization_and_optimizer(
     memory_reference_backend, tmp_path
 ):
-    layout = FixedMemoryQueryLayout.ncse(3, 4, batch_size=2)
+    layout = FixedMemoryQueryLayout.autoregressive(3, 4, batch_size=2)
 
     def make():
         return FixedMemoryQueryStack(
@@ -358,12 +358,12 @@ def test_adapter_dropout_serialization_and_optimizer(
 
 def test_adapter_and_fixed_metadata_validation():
     with pytest.raises(TypeError):
-        FixedMemoryQueryLayout.ncse(3, 4)
+        FixedMemoryQueryLayout.autoregressive(3, 4)
     with pytest.raises(ValueError):
-        FixedMemoryQueryLayout.ncse(3, 4, batch_size=0)
+        FixedMemoryQueryLayout.autoregressive(3, 4, batch_size=0)
     with pytest.raises(ValueError):
         FixedMemoryQueryStack([])
-    layout = FixedMemoryQueryLayout.ncse(3, 4, batch_size=2)
+    layout = FixedMemoryQueryLayout.autoregressive(3, 4, batch_size=2)
     for value in (
         torch.randn(11, 16),
         torch.randn(1, 11, 16),
@@ -375,7 +375,7 @@ def test_adapter_and_fixed_metadata_validation():
     for value in (torch.randn(22), torch.empty(22, 0), torch.randn(21, 16)):
         with pytest.raises(ValueError):
             unpack_fixed_memory_query(value, layout)
-    packed = PackedMemoryQueryLayout.ncse([3, 3], [4, 4])
+    packed = PackedMemoryQueryLayout.autoregressive([3, 3], [4, 4])
     with pytest.raises(ValueError):
         pack_fixed_memory_query(torch.randn(2, 11, 16), packed)
     with pytest.raises(ValueError):

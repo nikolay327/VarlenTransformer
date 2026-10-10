@@ -10,9 +10,9 @@ from varlen_transformer.memory_query import MemoryQueryBlock
 
 def inputs(packed, *, dtype=torch.float32, device="cpu", requires_grad=True):
     layout = (
-        PackedMemoryQueryLayout.ncse([3, 2, 3], [3, 2, 4], device=device)
+        PackedMemoryQueryLayout.autoregressive([3, 2, 3], [3, 2, 4], device=device)
         if packed
-        else FixedMemoryQueryLayout.ncse(3, 4, batch_size=2)
+        else FixedMemoryQueryLayout.autoregressive(3, 4, batch_size=2)
     )
     shape = (layout.total_tokens, 16)
     x = torch.randn(shape, dtype=dtype, device=device, requires_grad=requires_grad)
@@ -71,7 +71,7 @@ def test_stack_chaining_and_all_gradients(memory_reference_backend, packed):
 def test_fixed_dependency_graph_perturbations_and_input_jacobian(
     memory_reference_backend, depth
 ):
-    layout = FixedMemoryQueryLayout.ncse(3, 4, batch_size=1)
+    layout = FixedMemoryQueryLayout.autoregressive(3, 4, batch_size=1)
     blocks = [MemoryQueryBlock(16, 32, 2).eval() for _ in range(depth)]
     x = torch.randn(11, 16, requires_grad=True)
 
@@ -143,8 +143,8 @@ def test_packed_isolation_prefix_gather_and_dependency_graph(memory_reference_ba
 def test_fixed_and_uniform_packed_equivalence_and_gradient_scatter(
     memory_reference_backend,
 ):
-    fixed = FixedMemoryQueryLayout.ncse(3, 4, batch_size=2)
-    packed = PackedMemoryQueryLayout.ncse([3, 3], [4, 4])
+    fixed = FixedMemoryQueryLayout.autoregressive(3, 4, batch_size=2)
+    packed = PackedMemoryQueryLayout.autoregressive([3, 3], [4, 4])
     block = MemoryQueryBlock(16, 32, 2).eval()
     x = torch.randn(2, 11, 16, requires_grad=True)
     px = torch.cat((x[:, :6].flatten(0, 1), x[:, 6], x[:, 7:].flatten(0, 1)))
@@ -392,8 +392,8 @@ def test_invalid_block_configuration(memory_reference_backend, kwargs):
 
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("sm,d,t", [(3, 6, 2), (4, 4, 3), (7, 3, 4)])
-def test_non_ncse_block_geometry_is_rejected(packed, sm, d, t):
-    with pytest.raises(ValueError, match="NCSE"):
+def test_non_autoregressive_block_geometry_is_rejected(packed, sm, d, t):
+    with pytest.raises(ValueError, match="autoregressive"):
         if packed:
             PackedMemoryQueryLayout.from_lengths(
                 [sm, sm + 1], [d, max(1, d - 1)], [t, t]
@@ -461,8 +461,8 @@ def test_layout_integer_conversion_nonstrided_offsets_and_state_validation():
     with pytest.raises(ValueError):
         layout.validate(torch.empty(layout.total_tokens, 16, device="meta"), 16)
     with pytest.raises(ValueError):
-        PackedMemoryQueryLayout.ncse(torch.tensor([3]), [2])
+        PackedMemoryQueryLayout.autoregressive(torch.tensor([3]), [2])
     with pytest.raises(ValueError):
-        PackedMemoryQueryLayout.ncse([3], [2, 3])
+        PackedMemoryQueryLayout.autoregressive([3], [2, 3])
     with pytest.raises(ValueError):
         PackedMemoryQueryLayout.from_lengths([2**31], [1], [1])

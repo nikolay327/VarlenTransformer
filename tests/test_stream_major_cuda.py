@@ -8,7 +8,7 @@ import torch
 from tests.reference import (
     assert_gradients,
     memory_query_block_forward,
-    legacy_fixed_memory_query_reference,
+    fixed_memory_query_reference,
 )
 from varlen_transformer import (
     MemoryQueryBlock,
@@ -25,10 +25,10 @@ pytestmark = pytest.mark.cuda
 @pytest.mark.parametrize(
     "parameter_dtype", [torch.float32, torch.float16, torch.bfloat16]
 )
-def test_real_adapter_matches_legacy_equations_and_all_gradients(
+def test_real_adapter_matches_fixed_equations_and_all_gradients(
     depth, input_dtype, parameter_dtype
 ):
-    layout = FixedMemoryQueryLayout.ncse(3, 4, batch_size=2)
+    layout = FixedMemoryQueryLayout.autoregressive(3, 4, batch_size=2)
     stack = FixedMemoryQueryStack(
         [
             MemoryQueryBlock(32, 64, 2).to(device="cuda", dtype=parameter_dtype)
@@ -42,7 +42,7 @@ def test_real_adapter_matches_legacy_equations_and_all_gradients(
     ex, er = x.detach().clone().requires_grad_(), r.detach().clone().requires_grad_()
     h, residual = ex, er
     for ref in refs:
-        h, residual = legacy_fixed_memory_query_reference(ref, h, residual, 6, 3)
+        h, residual = fixed_memory_query_reference(ref, h, residual, 6, 3)
     actual, expected = stack(x, r, layout=layout), (h, residual)
     for a, e in zip(actual, expected):
         torch.testing.assert_close(a, e, rtol=0.04, atol=0.025)
@@ -56,7 +56,7 @@ def test_real_adapter_matches_legacy_equations_and_all_gradients(
 
 @pytest.mark.parametrize("memory_length", [127, 128, 129])
 def test_real_fixed_adapter_at_tile_boundaries(memory_length):
-    layout = FixedMemoryQueryLayout.ncse(memory_length - 3, 4, batch_size=2)
+    layout = FixedMemoryQueryLayout.autoregressive(memory_length - 3, 4, batch_size=2)
     stack = FixedMemoryQueryStack(
         [MemoryQueryBlock(32, 64, 2).cuda() for _ in range(2)]
     )
@@ -65,7 +65,7 @@ def test_real_fixed_adapter_at_tile_boundaries(memory_length):
     ex = x.detach().clone().requires_grad_()
     h, r = ex, None
     for ref in refs:
-        h, r = legacy_fixed_memory_query_reference(
+        h, r = fixed_memory_query_reference(
             ref, h, r, memory_length, memory_length - 3
         )
     actual, expected = stack(x, layout=layout), (h, r)
@@ -83,9 +83,9 @@ def test_real_fixed_adapter_at_tile_boundaries(memory_length):
 @pytest.mark.parametrize("e,heads", [(16, 1), (34, 2), (512, 2)])
 def test_real_native_head_padding_and_noncontiguous_inputs(packed, e, heads):
     layout = (
-        PackedMemoryQueryLayout.ncse([3, 3], [4, 4], device="cuda")
+        PackedMemoryQueryLayout.autoregressive([3, 3], [4, 4], device="cuda")
         if packed
-        else FixedMemoryQueryLayout.ncse(3, 4, batch_size=2)
+        else FixedMemoryQueryLayout.autoregressive(3, 4, batch_size=2)
     )
     block = MemoryQueryBlock(e, 2 * e, heads).cuda()
     ref = copy.deepcopy(block)
@@ -108,7 +108,7 @@ def test_real_native_head_padding_and_noncontiguous_inputs(packed, e, heads):
 
 def test_real_heterogeneous_stack_has_no_forbidden_paths_in_either_state():
     xl, ql, ml = [1, 3, 2], [1, 4, 2], [1, 6, 3]
-    layout = PackedMemoryQueryLayout.ncse(xl, ql, device="cuda")
+    layout = PackedMemoryQueryLayout.autoregressive(xl, ql, device="cuda")
     blocks = [MemoryQueryBlock(32, 64, 2).cuda().eval() for _ in range(3)]
     x = torch.randn(layout.total_tokens, 32, device="cuda", requires_grad=True)
     r = torch.randn_like(x, requires_grad=True)
@@ -135,7 +135,7 @@ def test_real_heterogeneous_stack_has_no_forbidden_paths_in_either_state():
 
 
 def test_real_device_metadata_requires_trust_and_forward_has_no_host_reads(monkeypatch):
-    layout = PackedMemoryQueryLayout.ncse([3, 2], [4, 2], device="cuda")
+    layout = PackedMemoryQueryLayout.autoregressive([3, 2], [4, 2], device="cuda")
     block = MemoryQueryBlock(32, 64, 2).cuda()
     x = torch.randn(layout.total_tokens, 32, device="cuda", requires_grad=True)
     names = (

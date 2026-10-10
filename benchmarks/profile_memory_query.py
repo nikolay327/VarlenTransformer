@@ -129,7 +129,7 @@ def configuration(args):
     xl = [m - q + 1 for m, q in zip(ml, ql)]
     if any(x <= 0 for x in xl) or max(sum(ml), sum(ql)) > 2**31 - 1:
         raise ValueError(
-            "NCSE memory must be at least query length, with int32-compatible totals"
+            "autoregressive memory must be at least query length, with int32-compatible totals"
         )
     return dict(
         implementation=args.implementation,
@@ -491,7 +491,12 @@ def build_workload(torch, vt, cfg, device):
         cfg["x_prefix_lengths"][0],
     )
     if fixed:
-        layout = vt.FixedMemoryQueryLayout.ncse(
+        layout_factory = (
+            vt.FixedMemoryQueryLayout.ncse
+            if legacy
+            else vt.FixedMemoryQueryLayout.autoregressive
+        )
+        layout = layout_factory(
             xp, sq, **({} if legacy else dict(batch_size=b))
         )
         shape = (b, sm + 1 + sq, e)

@@ -1,4 +1,4 @@
-"""Stack-level adapter for legacy fixed per-sample [M;V;Q] storage."""
+"""Convert per-sample [M;V;Q] storage around a fixed block stack."""
 
 from collections.abc import Iterable
 

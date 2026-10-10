@@ -1,10 +1,4 @@
-"""
-Custom implementation of a bidirectional/causal transformer block with fixed/variable sequence length input
-using optimized GPU kernels, flash_attn.flash_attn_qkvpacked_func and flash_attn.flash_attn_varlen_qkvpacked_func.
-See https://github.com/dao-ailab/flash-attention
-
-Input, weights, and biases are casted to bf16, while layer_norm computations are kept in fp32 for stability.
-"""
+"""BF16 self-attention blocks with FP32 LayerNorm and custom backward regions."""
 
 from typing import Optional, Tuple
 
@@ -27,9 +21,6 @@ def _to_bf16(x: Tensor) -> Tensor:
     return x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
 
 
-# Dropout layer customized to add more flexibility later.
-# TODO: add an option for epoch-based and fid-/bid-based seed for mask generation.
-# Generating the mask outside the fwd and bwd (inside the main class body) is an option.
 def _dropout_fwd(x: Tensor, p: float, training: bool) -> tuple[Tensor, Tensor]:
     if (not training) or p == 0.0:
         return x, torch.empty(0, device=x.device, dtype=torch.bool)
@@ -73,7 +64,6 @@ def _linear_bwd(
             out_dtype=torch.float32,
         ).squeeze(0)
     else:
-        # CPU dispatch permits testing the surrounding math without a CUDA kernel.
         grad_w = gy2.float().transpose(0, 1).matmul(x2.float())
     grad_b = gy2.sum(dim=0, dtype=torch.float32)
 
@@ -130,7 +120,7 @@ def _layernorm_bwd_fp32(
 
 
 @torch.library.custom_op(
-    "legendblock::pre_attn_qkv", mutates_args=(), device_types=("cpu", "cuda")
+    "varlen_transformer::pre_attn_qkv", mutates_args=(), device_types=("cpu", "cuda")
 )
 def pre_attn_qkv(
     hidden_states: Tensor,
@@ -296,7 +286,7 @@ pre_attn_qkv.register_autograd(_pre_backward, setup_context=_pre_setup_context)
 
 
 @torch.library.custom_op(
-    "legendblock::post_attn_mlp", mutates_args=(), device_types=("cpu", "cuda")
+    "varlen_transformer::post_attn_mlp", mutates_args=(), device_types=("cpu", "cuda")
 )
 def post_attn_mlp(
     attn_out: Tensor,
@@ -505,7 +495,6 @@ class Block(nn.Module):
 
     Chain blocks by passing both returned tensors to the next block. After the
     last block, add the branch to the residual before the final normalization.
-    Attention requires CUDA; CPU dispatch of the two custom ops is for tests.
     """
 
     def __init__(self, emb_dim, mixer_cls, mlp_cls, resid_dropout1, resid_dropout2):
@@ -545,7 +534,7 @@ class Block(nn.Module):
         )
 
         # dropout -> resid -> qkv
-        qkv, residual1, *_ = torch.ops.legendblock.pre_attn_qkv(
+        qkv, residual1, *_ = torch.ops.varlen_transformer.pre_attn_qkv(
             hidden_states,
             residual_in,
             self.norm_attn.weight,
@@ -590,7 +579,7 @@ class Block(nn.Module):
         attn_out = attn_out.reshape(*hidden_states.shape[:-1], self.mixer.emb_dim)
 
         # linear -> drop -> resid -> mlp
-        out, residual2, *_ = torch.ops.legendblock.post_attn_mlp(
+        out, residual2, *_ = torch.ops.varlen_transformer.post_attn_mlp(
             attn_out,
             residual1,
             self.mixer.out_proj.weight,
@@ -607,38 +596,3 @@ class Block(nn.Module):
         )
 
         return out, residual2
-
-
-# Eager reference without the custom ops or their explicit mixed-precision policy.
-class Block_(nn.Module):
-    def __init__(self, emb_dim, mixer_cls, mlp_cls, resid_dropout1, resid_dropout2):
-        super(Block_, self).__init__()
-
-        self.mixer = mixer_cls(emb_dim)
-        self.mlp = mlp_cls(emb_dim)
-
-        self.norm_attn = nn.LayerNorm(emb_dim)
-        self.norm_mlp = nn.LayerNorm(emb_dim)
-
-        self.dropout1 = nn.Dropout(resid_dropout1)
-        self.dropout2 = nn.Dropout(resid_dropout2)
-
-    def forward(
-        self,
-        hidden_states: Tensor,
-        residual: Optional[Tensor] = None,
-        cu_seqlens: Optional[Tensor] = None,
-        max_seqlen: Optional[int] = None,
-    ) -> Tuple[Tensor, Tensor]:
-        # prenorm path
-        dropped = self.dropout1(hidden_states)
-        residual = (residual + dropped) if residual is not None else dropped
-
-        hidden_states = self.norm_attn(residual)
-        hidden_states = self.mixer(hidden_states, cu_seqlens, max_seqlen)
-        residual = residual + self.dropout2(hidden_states)
-
-        hidden_states = self.norm_mlp(residual)
-        hidden_states = self.mlp(hidden_states)
-
-        return hidden_states, residual

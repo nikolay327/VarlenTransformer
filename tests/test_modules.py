@@ -7,8 +7,8 @@ from torch.nn import functional as F
 
 from tests.reference import assert_gradients, attention, block_forward, packed_attention
 from varlen_transformer import MHA, MLP, Block, create_block
-from varlen_transformer.block import Block_
-from varlen_transformer.cls import _create_mha_cls, _create_mlp_cls
+from tests.reference import EagerBlockReference
+from varlen_transformer.factories import _mha_factory, _mlp_factory
 
 
 @pytest.mark.parametrize("causal", [False, True])
@@ -39,8 +39,8 @@ def test_factory_honors_explicit_dropouts_and_partial_classes(reference_backend)
         0.2,
         0.3,
     )
-    assert _create_mha_cls(2, 0.1, True)(16).causal
-    assert _create_mlp_cls(48)(16).fc1.out_features == 48
+    assert _mha_factory(2, 0.1, True)(16).causal
+    assert _mlp_factory(48)(16).fc1.out_features == 48
 
 
 @pytest.mark.parametrize(
@@ -268,8 +268,8 @@ def test_state_dict_roundtrip_and_optimizer_training(reference_backend, tmp_path
     assert not torch.equal(restored.mixer.Wqkv.weight, before)
 
 
-def test_eager_legacy_block_remains_usable_for_both_layouts(reference_backend):
-    block = Block_(16, partial(MHA, num_heads=2), partial(MLP, hidden_dim=32), 0.0, 0.0)
+def test_eager_reference_supports_both_layouts(reference_backend):
+    block = EagerBlockReference(16, partial(MHA, num_heads=2), partial(MLP, hidden_dim=32), 0.0, 0.0)
     fixed = torch.randn(2, 3, 16, requires_grad=True)
     h, residual = block(fixed)
     assert h.shape == residual.shape == fixed.shape

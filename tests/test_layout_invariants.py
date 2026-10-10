@@ -14,7 +14,7 @@ def test_fixed_rejects_non_autoregressive_geometry(m, q, x):
 
 @pytest.mark.parametrize("memory", [[6, 4, 5], [5, 3, 5], [6, 2, 6]])
 def test_heterogeneous_builder_checks_each_sample(memory):
-    with pytest.raises(ValueError, match="NCSE sample"):
+    with pytest.raises(ValueError, match="autoregressive sample"):
         PackedMemoryQueryLayout.from_lengths(memory, [4, 2, 3], [3, 2, 3])
 
 
@@ -36,7 +36,7 @@ def raw(layout, **changes):
 
 
 def test_builders_and_cpu_direct_construction_are_verified():
-    layout = PackedMemoryQueryLayout.ncse([3, 2, 3], [4, 2, 3])
+    layout = PackedMemoryQueryLayout.autoregressive([3, 2, 3], [4, 2, 3])
     direct = raw(layout)
     assert layout.metadata_verified and direct.metadata_verified
     assert direct.to("cpu").metadata_verified
@@ -47,7 +47,7 @@ def test_builders_and_cpu_direct_construction_are_verified():
     "case", ["start", "end", "empty", "geometry", "prefix", "maximum"]
 )
 def test_direct_cpu_metadata_values_are_checked(case):
-    layout = PackedMemoryQueryLayout.ncse([3, 2], [4, 2])
+    layout = PackedMemoryQueryLayout.autoregressive([3, 2], [4, 2])
     changes = {}
     if case == "start":
         changes["cu_seqlens_q"] = torch.tensor([1, 4, 6])
@@ -66,7 +66,7 @@ def test_direct_cpu_metadata_values_are_checked(case):
 
 
 def test_device_metadata_requires_explicit_trust_without_host_reads(monkeypatch):
-    verified = PackedMemoryQueryLayout.ncse([3, 2], [4, 2], device="meta")
+    verified = PackedMemoryQueryLayout.autoregressive([3, 2], [4, 2], device="meta")
 
     def forbidden(*args, **kwargs):
         raise AssertionError("read of device tensor contents")
@@ -82,7 +82,7 @@ def test_device_metadata_requires_explicit_trust_without_host_reads(monkeypatch)
 
 
 def test_trust_opt_in_keeps_structural_and_global_geometry_checks():
-    verified = PackedMemoryQueryLayout.ncse([3, 2], [4, 2])
+    verified = PackedMemoryQueryLayout.autoregressive([3, 2], [4, 2])
     trusted = raw(verified, trust_metadata=True)
     assert not trusted.metadata_verified
     with pytest.raises(ValueError, match="totals"):
