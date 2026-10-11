@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "VarlenTransformer"
-version = "0.3.0"
+version = "0.4.0"
 description = "BF16 transformer blocks for packed variable-length and fixed-length FlashAttention"
 readme = "README.md"
 license = "MIT AND BSD-3-Clause"
@@ -38,6 +38,7 @@ testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 markers = [
     "cuda: requires a compatible NVIDIA GPU and the real FlashAttention package",
+    "fusion: requires CUDA, FlashAttention, and the optional Triton backend",
 ]
 
 [tool.coverage.run]
