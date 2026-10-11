@@ -184,7 +184,56 @@ Layouts check their geometry at construction. `layout.validate(state, emb_dim)`
 checks a flat state, while a fixed layout's `validate_per_sample(state, emb_dim)`
 checks `(B, S_M + 1 + S_Q, E)` storage. The packing and unpacking functions
 operate on these prepared layouts and states. Model dimensions, dropout
-settings are checked when configured.
+settings, and fusion modes are checked when configured.
+
+## Optional CUDA fusion
+
+Enable LayerNorm and residual normalization fusion through the `fusion` keyword
+on `Block`, `MemoryQueryBlock`, `create_block`, or `create_memory_query_block`.
+Each block has its own configuration, with `off` as the default. This works
+directly in Python scripts and Jupyter notebooks:
+
+```python
+from varlen_transformer import create_block, create_memory_query_block
+
+standard = create_block(512, 2048, 8, causal=True, fusion="residual_fwd_bwd").cuda()
+memory_query = create_memory_query_block(512, 2048, 8, fusion="residual_fwd").cuda()
+
+# Change an existing block for subsequent forward calls.
+standard.fusion = "residual_fwd"
+standard.eval()
+```
+
+Configuration is validated when creating a block or assigning `block.fusion`.
+Each forward passes its mode explicitly to the custom operations, which save it
+for backward. Changing a block's mode does not change graphs already created,
+or another block's mode. `train()` and `eval()` retain the selected mode.
+Fusion settings are runtime configuration and are not included in `state_dict`;
+choose the mode when rebuilding a model before loading its weights.
+
+| Mode | Forward | Backward |
+| --- | --- | --- |
+| `off` | ATen | ATen |
+| `ln_fwd` | Welford LayerNorm | ATen |
+| `residual_fwd` | Residual plus Welford LayerNorm where supported | ATen |
+| `ln_bwd` | ATen | FP32 LayerNorm gradients |
+| `ln_fwd_bwd` | Welford LayerNorm | FP32 LayerNorm gradients |
+| `residual_fwd_bwd` | Residual plus Welford LayerNorm where supported | FP32 LayerNorm gradients |
+
+Forward uses a vectorized Welford reduction and FP32 affine arithmetic. It
+accepts contiguous BF16 inputs with embedding widths from 32 through 4096
+divisible by four. Unsupported widths, layouts, and
+parameter alignment use the existing ATen forward. Backward uses fixed row
+tiles and a bounded second reduction; oversized reductions use ATen.
+MemoryQuery partial residual updates require flat stream-major tensors;
+batched partial updates retain the existing implementation.
+
+Residual sums round to BF16 before FP32 normalization, and gradient outputs
+remain FP32 until the existing custom backward applies its storage-dtype
+boundary. Dropout and its saved masks, RNG advancement, saved tensor ownership,
+FlashAttention, linear operations, and first-order autograd behavior follow the
+existing paths. Compilation and execution errors propagate.
+Dispatch selects kernels using device, dtype, shape, layout, and alignment.
 
 ## Testing
 
@@ -197,6 +246,21 @@ python -m pytest --require-cuda
 ```
 
 `--require-cuda` fails when the required GPU or FlashAttention environment is unavailable, rather than silently skipping CUDA tests. GitHub Actions runs CPU tests automatically; the GPU workflow is manually triggered on a compatible self-hosted runner.
+
+Fusion CUDA tests also carry the `fusion` marker and exercise real kernels,
+strict BF16 forward boundaries, partial-update storage ownership, dropout/RNG,
+parameter gradients, frozen parameters, and repeated optimizer updates.
+They require CUDA, FlashAttention, and Triton; ordinary test runs skip
+them when those optional prerequisites are absent. `--require-fusion` makes
+missing prerequisites fail, so a required fusion validation cannot pass by
+skipping its accelerator tests. CPU fallback and fake-tensor tests always run.
+The tests configure each model through the Python API and observe backend calls
+using test fixtures. They also cover independent block modes, reconfiguration
+between forward and backward, and explicit-mode AOT dispatch.
+
+```bash
+python -m pytest -q --require-cuda --require-fusion
+```
 
 ## Local CUDA benchmarking and visualization
 
