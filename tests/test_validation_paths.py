@@ -14,6 +14,7 @@ from varlen_transformer import (
     create_block,
     create_memory_query_block,
 )
+from varlen_transformer import _fusion
 
 
 def execution_case(kind):
@@ -75,6 +76,7 @@ def test_forward_and_backward_bypass_input_validation(
         raise AssertionError("input validation during model execution")
 
     monkeypatch.setattr(model, "validate_inputs", forbidden)
+    monkeypatch.setattr(_fusion, "validate_mode", forbidden)
     for name in ("block", "mha", "cross_mha"):
         module = importlib.import_module("varlen_transformer." + name)
         for validator in ("validate_attention_input", "validate_cross_attention_input"):

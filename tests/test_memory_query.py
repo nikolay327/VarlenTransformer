@@ -170,9 +170,9 @@ def test_exact_three_kernel_calls_and_shared_fused_operations(
         linear_calls.append((x.shape, w.shape))
         return linear(x, w, b)
 
-    def observe_norm(x, w, b, eps):
+    def observe_norm(x, w, b, eps, fusion="off"):
         norm_calls.append((x.shape, w))
-        return norm(x, w, b, eps)
+        return norm(x, w, b, eps, fusion)
 
     monkeypatch.setattr(ops, "_linear_fwd", observe_linear)
     monkeypatch.setattr(ops, "_layernorm_fwd_fp32", observe_norm)

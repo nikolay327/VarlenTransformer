@@ -8,6 +8,7 @@ from torch import Tensor
 from torch.autograd.function import once_differentiable
 
 from ._validation import validate_attention_input
+from . import _fusion
 
 try:
     from flash_attn import flash_attn_qkvpacked_func, flash_attn_varlen_qkvpacked_func
@@ -85,7 +86,11 @@ def _layernorm_fwd_fp32(
     weight: Tensor,
     bias: Tensor,
     eps: float,
+    fusion: str = "off",
 ):
+    fused = _fusion.layernorm_forward(x_bf16, weight, bias, eps, fusion)
+    if fused is not None:
+        return fused
     x_fp32 = x_bf16.float()
     w_fp32 = weight.float()
     b_fp32 = bias.float()
@@ -103,7 +108,13 @@ def _layernorm_bwd_fp32(
     rstd_fp32: Tensor,
     weight: Tensor,
     bias: Tensor,
+    fusion: str = "off",
 ):
+    fused = _fusion.layernorm_backward(
+        grad_y, x_bf16, mean_fp32, rstd_fp32, weight, bias, fusion
+    )
+    if fused is not None:
+        return fused
     grad_x_fp32, grad_w_fp32, grad_b_fp32 = (
         torch.ops.aten.native_layer_norm_backward.default(
             grad_y.float(),
@@ -134,16 +145,20 @@ def pre_attn_qkv(
     norm_eps: float,
     num_heads: int,
     head_dim: int,
+    fusion: str = "off",
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     hs = _to_bf16(hidden_states)
     res = _to_bf16(residual)
 
     dropped1, mask1 = _dropout_fwd(hs, resid_dropout_p, training)
-    residual1 = res + dropped1
-
-    ln_out, mean, rstd = _layernorm_fwd_fp32(
-        residual1, norm_weight, norm_bias, norm_eps
-    )
+    fused = _fusion.residual_forward(res, dropped1, norm_weight, norm_bias, norm_eps, fusion=fusion)
+    if fused is None:
+        residual1 = res + dropped1
+        ln_out, mean, rstd = _layernorm_fwd_fp32(
+            residual1, norm_weight, norm_bias, norm_eps, fusion
+        )
+    else:
+        residual1, ln_out, mean, rstd = fused
 
     wqkv_weight_bf16 = _to_bf16(wqkv_weight)
     wqkv_bias_bf16 = _to_bf16(wqkv_bias)
@@ -166,6 +181,7 @@ def _(
     norm_eps: float,
     num_heads: int,
     head_dim: int,
+    fusion: str = "off",
 ):
     qkv = hidden_states.new_empty(
         (*hidden_states.shape[:-1], 3, num_heads, head_dim), dtype=torch.bfloat16
@@ -195,6 +211,7 @@ def _pre_setup_context(ctx, inputs, output):
         norm_eps,
         num_heads,
         head_dim,
+        fusion,
     ) = inputs
 
     qkv, residual1, mask1, mean, rstd, ln_out = output
@@ -219,6 +236,7 @@ def _pre_setup_context(ctx, inputs, output):
     ctx.norm_eps = norm_eps
     ctx.num_heads = num_heads
     ctx.head_dim = head_dim
+    ctx.fusion = fusion
 
 
 @once_differentiable
@@ -254,7 +272,7 @@ def _pre_backward(ctx, grad_qkv, grad_residual1, *unused_aux_grads):
     )
 
     grad_residual1_from_ln, grad_norm_w, grad_norm_b = _layernorm_bwd_fp32(
-        grad_ln_out, residual1, mean, rstd, norm_weight, norm_bias
+        grad_ln_out, residual1, mean, rstd, norm_weight, norm_bias, ctx.fusion
     )
 
     grad_residual1_total = grad_residual1.float() + grad_residual1_from_ln
@@ -274,6 +292,7 @@ def _pre_backward(ctx, grad_qkv, grad_residual1, *unused_aux_grads):
         grad_norm_b.to(norm_bias.dtype),
         grad_wqkv_w.to(wqkv_weight.dtype),
         grad_wqkv_b.to(wqkv_bias.dtype),
+        None,
         None,
         None,
         None,
@@ -302,6 +321,7 @@ def post_attn_mlp(
     resid_dropout_p: float,
     training: bool,
     norm_eps: float,
+    fusion: str = "off",
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     attn_out_bf16 = _to_bf16(attn_out)
     residual1_bf16 = _to_bf16(residual1)
@@ -311,11 +331,16 @@ def post_attn_mlp(
     attn_proj = _linear_fwd(attn_out_bf16, out_proj_weight_bf16, out_proj_bias_bf16)
 
     dropped2, mask2 = _dropout_fwd(attn_proj, resid_dropout_p, training)
-    residual2 = residual1_bf16 + dropped2
-
-    ln_out, mean, rstd = _layernorm_fwd_fp32(
-        residual2, norm_weight, norm_bias, norm_eps
+    fused = _fusion.residual_forward(
+        residual1_bf16, dropped2, norm_weight, norm_bias, norm_eps, fusion=fusion
     )
+    if fused is None:
+        residual2 = residual1_bf16 + dropped2
+        ln_out, mean, rstd = _layernorm_fwd_fp32(
+            residual2, norm_weight, norm_bias, norm_eps, fusion
+        )
+    else:
+        residual2, ln_out, mean, rstd = fused
 
     fc1_weight_bf16 = _to_bf16(fc1_weight)
     fc1_bias_bf16 = _to_bf16(fc1_bias)
@@ -344,6 +369,7 @@ def _(
     resid_dropout_p: float,
     training: bool,
     norm_eps: float,
+    fusion: str = "off",
 ):
     out = attn_out.new_empty(attn_out.shape, dtype=torch.bfloat16)
     residual2 = residual1.new_empty(residual1.shape, dtype=torch.bfloat16)
@@ -380,6 +406,7 @@ def _post_setup_context(ctx, inputs, output):
         resid_dropout_p,
         training,
         norm_eps,
+        fusion,
     ) = inputs
 
     out, residual2, mask2, mean, rstd, ln_out, gelu_in, gelu_out = output
@@ -408,6 +435,7 @@ def _post_setup_context(ctx, inputs, output):
     ctx.resid_dropout_p = resid_dropout_p
     ctx.training = training
     ctx.norm_eps = norm_eps
+    ctx.fusion = fusion
 
 
 @once_differentiable
@@ -456,7 +484,7 @@ def _post_backward(ctx, grad_out, grad_residual2, *unused_aux_grads):
     )
 
     grad_residual2_from_ln, grad_norm_w, grad_norm_b = _layernorm_bwd_fp32(
-        grad_ln_out, residual2, mean, rstd, norm_weight, norm_bias
+        grad_ln_out, residual2, mean, rstd, norm_weight, norm_bias, ctx.fusion
     )
     grad_residual2_total = grad_residual2_total + grad_residual2_from_ln
 
@@ -484,6 +512,7 @@ def _post_backward(ctx, grad_out, grad_residual2, *unused_aux_grads):
         None,
         None,
         None,
+        None,
     )
 
 
@@ -497,8 +526,9 @@ class Block(nn.Module):
     last block, add the branch to the residual before the final normalization.
     """
 
-    def __init__(self, emb_dim, mixer_cls, mlp_cls, resid_dropout1, resid_dropout2):
+    def __init__(self, emb_dim, mixer_cls, mlp_cls, resid_dropout1, resid_dropout2, *, fusion="off"):
         super(Block, self).__init__()
+        self.fusion = fusion
 
         self.mixer = mixer_cls(emb_dim)
         self.mlp = mlp_cls(emb_dim)
@@ -508,6 +538,15 @@ class Block(nn.Module):
 
         self.dropout1 = nn.Dropout(resid_dropout1)
         self.dropout2 = nn.Dropout(resid_dropout2)
+
+    @property
+    def fusion(self) -> str:
+        """Fusion mode used by subsequent forward calls."""
+        return self._fusion_mode
+
+    @fusion.setter
+    def fusion(self, mode: str):
+        self._fusion_mode = _fusion.validate_mode(mode)
 
     def validate_inputs(
         self,
@@ -538,6 +577,7 @@ class Block(nn.Module):
         cu_seqlens: Optional[Tensor] = None,
         max_seqlen: Optional[int] = None,
     ) -> Tuple[Tensor, Tensor]:
+        fusion = self.fusion
         residual_in = (
             residual if residual is not None else torch.zeros_like(hidden_states)
         )
@@ -555,6 +595,7 @@ class Block(nn.Module):
             self.norm_attn.eps,
             self.mixer.num_heads,
             self.mixer.head_dim,
+            fusion,
         )
 
         # qkv -> attn
@@ -602,6 +643,7 @@ class Block(nn.Module):
             self.dropout2.p,
             self.training,
             self.norm_mlp.eps,
+            fusion,
         )
 
         return out, residual2

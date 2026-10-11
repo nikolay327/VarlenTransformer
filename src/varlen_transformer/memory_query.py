@@ -5,6 +5,7 @@ import math
 import torch
 from torch import Tensor, nn
 
+from . import _fusion
 from ._memory_ops import mq_pre_sa, mq_pre_ca, mq_post_ca_mlp
 from .cross_mha import CrossMHA
 from .layout import FixedMemoryQueryLayout, PackedMemoryQueryLayout
@@ -58,8 +59,11 @@ class MemoryQueryBlock(nn.Module):
         sa_resid_dropout: float = 0.0,
         ca_resid_dropout: float = 0.0,
         norm_eps: float = 1e-5,
+        *,
+        fusion: str = "off",
     ):
         super().__init__()
+        self.fusion = fusion
         self.memory_mixer = MHA(
             emb_dim, num_heads, attn_dropout=attn_dropout, causal=True
         )
@@ -78,6 +82,15 @@ class MemoryQueryBlock(nn.Module):
         self.dropout_input = nn.Dropout(entry_resid_dropout)
         self.dropout_sa = nn.Dropout(sa_resid_dropout)
         self.dropout_ca = nn.Dropout(ca_resid_dropout)
+
+    @property
+    def fusion(self) -> str:
+        """Fusion mode used by subsequent forward calls."""
+        return self._fusion_mode
+
+    @fusion.setter
+    def fusion(self, mode: str):
+        self._fusion_mode = _fusion.validate_mode(mode)
 
     def validate_inputs(
         self,
@@ -108,6 +121,7 @@ class MemoryQueryBlock(nn.Module):
         *,
         layout: FixedMemoryQueryLayout | PackedMemoryQueryLayout,
     ) -> tuple[Tensor, Tensor]:
+        fusion = self.fusion
         residual_in = torch.zeros_like(hidden_states) if residual is None else residual
         n, e = layout.num_memory_tokens, self.memory_mixer.emb_dim
         sa, ca = self.memory_mixer, self.cross_mixer
@@ -124,6 +138,7 @@ class MemoryQueryBlock(nn.Module):
             sa.num_heads,
             sa.head_dim,
             n,
+            fusion,
         )
         sa_opts = _attention_options(sa.attn, self.training)
         if isinstance(layout, FixedMemoryQueryLayout):
@@ -160,6 +175,7 @@ class MemoryQueryBlock(nn.Module):
             ca.num_heads,
             ca.head_dim,
             n,
+            fusion,
         )
         ca_opts = _attention_options(ca.attn, self.training)
         b = layout.batch_size
@@ -222,5 +238,6 @@ class MemoryQueryBlock(nn.Module):
             self.training,
             self.norm_mlp.eps,
             n,
+            fusion,
         )
         return branch, r1

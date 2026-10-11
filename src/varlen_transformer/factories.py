@@ -26,8 +26,10 @@ def create_block(
     block_resid_dropout1: float | None = None,
     block_resid_dropout2: float | None = None,
     causal: bool = False,
+    *,
+    fusion: str = "off",
 ) -> Block:
-    """Create a BF16 block; use ``causal=True`` for autoregressive attention."""
+    """Create a BF16 block with optional CUDA fusion; causal=True is autoregressive."""
     mixer_cls = _mha_factory(
         num_attention_heads=num_attention_heads,
         attn_dropout=0.0 if attn_dropout is None else attn_dropout,
@@ -45,6 +47,7 @@ def create_block(
         resid_dropout2=block_resid_dropout2
         if block_resid_dropout2 is not None
         else 0.0,
+        fusion=fusion,
     )
 
 
@@ -57,6 +60,8 @@ def create_memory_query_block(
     sa_resid_dropout: float | None = None,
     ca_resid_dropout: float | None = None,
     norm_eps: float = 1e-5,
+    *,
+    fusion: str = "off",
 ) -> MemoryQueryBlock:
     """Causal memory SA -> shared V/Q CA -> shared FFN, with BF16 branch/residual."""
     return MemoryQueryBlock(
@@ -68,4 +73,5 @@ def create_memory_query_block(
         sa_resid_dropout=0.0 if sa_resid_dropout is None else sa_resid_dropout,
         ca_resid_dropout=0.0 if ca_resid_dropout is None else ca_resid_dropout,
         norm_eps=norm_eps,
+        fusion=fusion,
     )
