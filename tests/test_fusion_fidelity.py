@@ -77,21 +77,33 @@ def test_small_strict_shape_uses_native_arithmetic(monkeypatch, mode):
 
 @pytest.mark.cuda
 @pytest.mark.fusion
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(2,9,16),(2,9,128),(9,128)])
+@pytest.mark.parametrize("dtype", [torch.float32,torch.bfloat16])
 @pytest.mark.parametrize("p,training", [(0.0,True),(0.25,True),(0.25,False),(1.0,True)])
-def test_strict_mq_pre_ca_boundary_and_dropout(dtype, p, training):
+def test_strict_mq_pre_ca_boundary_and_dropout(fusion_calls,shape,dtype,p,training):
     from tests.memory_reference import make_args, pre_ca_reference
     from varlen_transformer._memory_ops import mq_pre_ca
     from tests.reference import clone_args
+
     torch.manual_seed(1729)
-    args = make_args("ca", (2,9,16), device="cuda", dtype=dtype, p=p, training=training)
+    args = make_args("ca",shape,device="cuda",dtype=dtype,p=p,training=training)
     cloned = clone_args(args)
     torch.manual_seed(711)
     baseline = mq_pre_ca(*cloned)
     rng = torch.cuda.get_rng_state()
     torch.manual_seed(711)
-    actual = mq_pre_ca(*args, fusion="residual_fwd_bwd")
-    assert torch.equal(rng, torch.cuda.get_rng_state())
+    actual = mq_pre_ca(*args,fusion="residual_fwd_bwd")
+
+    assert torch.equal(rng,torch.cuda.get_rng_state())
+    if shape == (9,128):
+        assert fusion_calls["residual_forward"] > 0
+    elif shape == (2,9,128):
+        assert fusion_calls["ln_forward"] > 0
+        assert fusion_calls["residual_forward"] == 0
+    else:
+        assert fusion_calls["ln_forward"] == 0
+        assert fusion_calls["residual_forward"] == 0
+
     for a,b in zip(actual,baseline):
         torch.testing.assert_close(a,b,rtol=0,atol=0)
     for a,b in zip(actual[:3],pre_ca_reference(clone_args(args),actual[3])):
