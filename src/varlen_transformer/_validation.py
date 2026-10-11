@@ -1,4 +1,4 @@
-"""Structural checks that do not synchronize CUDA tensors to the host."""
+"""Input shape, dtype, and sequence metadata checks."""
 
 import torch
 from torch import Tensor

@@ -65,6 +65,11 @@ def pytest_addoption(parser):
         action="store_true",
         help="Fail instead of skipping when real CUDA/FlashAttention tests cannot run",
     )
+    parser.addoption(
+        "--require-fusion",
+        action="store_true",
+        help="Fail instead of skipping when CUDA, FlashAttention, or Triton fusion tests cannot run",
+    )
 
 
 def cuda_unavailable_reason():
@@ -97,6 +102,15 @@ def cuda_unavailable_reason():
     return None
 
 
+def fusion_unavailable_reason():
+    reason = cuda_unavailable_reason()
+    if reason:
+        return reason
+    if importlib.util.find_spec("triton") is None:
+        return "the optional Triton fusion backend is not installed"
+    return None
+
+
 def pytest_sessionstart(session):
     torch.set_num_threads(1)
     if session.config.getoption("--require-cuda"):
@@ -105,14 +119,30 @@ def pytest_sessionstart(session):
             raise pytest.UsageError(
                 f"--require-cuda: {reason}. Install a compatible CUDA PyTorch and flash-attn build."
             )
+    if session.config.getoption("--require-fusion"):
+        reason = fusion_unavailable_reason()
+        if reason:
+            raise pytest.UsageError(f"--require-fusion: {reason}")
 
 
 def pytest_collection_modifyitems(config, items):
+    if config.getoption("--require-fusion") and not any(
+        item.get_closest_marker("fusion") for item in items
+    ):
+        raise pytest.UsageError(
+            "--require-fusion collected no fusion-marked tests; refusing an empty validation"
+        )
     cuda_items = [item for item in items if item.get_closest_marker("cuda")]
     if cuda_items:
         reason = cuda_unavailable_reason()
         if reason:
             for item in cuda_items:
+                item.add_marker(pytest.mark.skip(reason=reason))
+    fusion_items = [item for item in items if item.get_closest_marker("fusion")]
+    if fusion_items:
+        reason = fusion_unavailable_reason()
+        if reason:
+            for item in fusion_items:
                 item.add_marker(pytest.mark.skip(reason=reason))
 
 
@@ -121,6 +151,28 @@ def reproducible_randomness():
     torch.manual_seed(1729)
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = False
+
+
+@pytest.fixture
+def fusion_calls(monkeypatch):
+    """Count backend calls made by a fusion test."""
+    from collections import Counter
+    from varlen_transformer import _fusion
+
+    backend = _fusion._load()
+    assert backend is not None, "Fusion tests require the optional Triton backend"
+    calls = Counter()
+    for name, key in (("forward", "ln_forward"), ("residual_forward", "residual_forward"), ("backward", "ln_backward")):
+        original = getattr(backend, name)
+
+        def observed(*args, _original=original, _key=key, **kwargs):
+            result = _original(*args, **kwargs)
+            if result is not None:
+                calls[_key] += 1
+            return result
+
+        monkeypatch.setattr(backend, name, observed)
+    return calls
 
 
 @pytest.fixture

@@ -26,12 +26,12 @@ class FixedMemoryQueryLayout:
             raise ValueError("x_prefix_length cannot exceed memory_length")
         if self.memory_length != self.x_prefix_length + self.query_length - 1:
             raise ValueError(
-                "NCSE layout requires memory_length = x_prefix_length + query_length - 1"
+                "autoregressive layout requires memory_length = x_prefix_length + query_length - 1"
             )
 
     @classmethod
-    def ncse(cls, x_prefix_length: int, query_length: int, *, batch_size: int):
-        """M=[x; theta_<D], Q has D tokens, with native rectangular causality."""
+    def autoregressive(cls, x_prefix_length: int, query_length: int, *, batch_size: int):
+        """Derive memory length from the observation prefix and density queries."""
         positive_int("x_prefix_length", x_prefix_length)
         positive_int("query_length", query_length)
         return cls(
@@ -54,6 +54,7 @@ class FixedMemoryQueryLayout:
         return self.num_memory_tokens + self.batch_size + self.num_query_tokens
 
     def validate(self, hidden_states: Tensor, emb_dim: int):
+        """Check a flat stream-major state against this layout."""
         expected = self.total_tokens
         if (
             hidden_states.ndim != 2
@@ -64,6 +65,17 @@ class FixedMemoryQueryLayout:
                 f"native fixed state must have floating stream-major shape ({expected}, {emb_dim}); "
                 "use FixedMemoryQueryStack for per-sample (B,S,E) input"
             )
+
+    def validate_per_sample(self, hidden_states: Tensor, emb_dim: int):
+        """Check per-sample [M;V;Q] state against this layout."""
+        expected = (self.batch_size, self.memory_length + 1 + self.query_length, emb_dim)
+        if (
+            hidden_states.ndim != 3
+            or hidden_states.shape != expected
+            or emb_dim <= 0
+            or not hidden_states.is_floating_point()
+        ):
+            raise ValueError(f"per-sample state must have floating shape {expected}")
 
 
 @dataclass(frozen=True)
@@ -138,7 +150,7 @@ class PackedMemoryQueryLayout:
         nx = self.x_prefix_indices.numel()
         if self.num_memory_tokens != nx + self.num_query_tokens - self.batch_size:
             raise ValueError(
-                "packed totals violate the NCSE memory = x + query - 1 invariant"
+                "packed totals violate the autoregressive memory = x + query - 1 invariant"
             )
         for maximum, total in (
             (self.max_seqlen_m, self.num_memory_tokens),
@@ -151,7 +163,7 @@ class PackedMemoryQueryLayout:
             if self.cu_seqlens_m.device.type != "cpu":
                 raise ValueError(
                     "device-resident metadata requires explicit trust_metadata=True; "
-                    "use from_lengths() for verified NCSE construction"
+                    "use from_lengths() for verified autoregressive construction"
                 )
             self._verify_cpu_values()
             object.__setattr__(self, "metadata_verified", True)
@@ -196,7 +208,7 @@ class PackedMemoryQueryLayout:
         for sample, (m, q, x) in enumerate(zip(*lengths)):
             if m != x + q - 1:
                 raise ValueError(
-                    f"NCSE sample {sample} requires memory_length = x_prefix_length + query_length - 1"
+                    f"autoregressive sample {sample} requires memory_length = x_prefix_length + query_length - 1"
                 )
         expected = [
             index
@@ -225,7 +237,7 @@ class PackedMemoryQueryLayout:
         *,
         device=None,
     ):
-        """Construct static metadata from host Python lengths, never CUDA reads."""
+        """Build offsets and prefix indices from host sequence lengths."""
         if any(
             isinstance(lengths, Tensor)
             for lengths in (memory_lengths, query_lengths, x_prefix_lengths)
@@ -248,7 +260,7 @@ class PackedMemoryQueryLayout:
         for sample, (m, q, x) in enumerate(zip(ml, ql, xl)):
             if m != x + q - 1:
                 raise ValueError(
-                    f"NCSE sample {sample} requires memory_length = x_prefix_length + query_length - 1"
+                    f"autoregressive sample {sample} requires memory_length = x_prefix_length + query_length - 1"
                 )
         mo, qo, xo = ([0, *accumulate(lengths)] for lengths in (ml, ql, xl))
         offsets = [
@@ -275,7 +287,7 @@ class PackedMemoryQueryLayout:
         return result
 
     @classmethod
-    def ncse(
+    def autoregressive(
         cls,
         x_prefix_lengths: Sequence[int],
         query_lengths: Sequence[int],
@@ -286,7 +298,7 @@ class PackedMemoryQueryLayout:
             isinstance(lengths, Tensor) for lengths in (x_prefix_lengths, query_lengths)
         ):
             raise ValueError(
-                "ncse expects host Python lengths; use precomputed metadata for tensor lengths"
+                "autoregressive expects host Python lengths; use precomputed metadata for tensor lengths"
             )
         xl, ql = tuple(x_prefix_lengths), tuple(query_lengths)
         if len(xl) != len(ql):
@@ -315,6 +327,7 @@ class PackedMemoryQueryLayout:
         return result
 
     def validate(self, hidden_states: Tensor, emb_dim: int):
+        """Check packed state shape, dtype, and metadata device."""
         if (
             hidden_states.ndim != 2
             or hidden_states.shape != (self.total_tokens, emb_dim)

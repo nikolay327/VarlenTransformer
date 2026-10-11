@@ -340,7 +340,7 @@ def test_native_and_wrapper_benchmark_workloads_agree(memory_reference_backend, 
     cleanup()
     end_to_end = cases[1][1]()
     cleanup()
-    layout = vt.FixedMemoryQueryLayout.ncse(2, 3, batch_size=2)
+    layout = vt.FixedMemoryQueryLayout.autoregressive(2, 3, batch_size=2)
     for flat, per_sample in zip(core, end_to_end):
         torch.testing.assert_close(
             flat, vt.pack_fixed_memory_query(per_sample, layout), rtol=0, atol=0
@@ -391,3 +391,19 @@ def test_packed_benchmark_runs_the_heterogeneous_workload(
     cleanup()
     assert h.shape == residual.shape == (20, 16)
     assert torch.isfinite(h).all() and torch.isfinite(residual).all()
+
+
+def test_memory_query_driver_accepts_fusion_and_records_it():
+    assert config("--fusion", "ln_fwd")["fusion"] == "ln_fwd"
+    assert config()["fusion"] == "off"
+    with pytest.raises(ValueError, match="does not support fusion"):
+        config("--implementation", "legacy", "--fusion", "residual_fwd")
+
+
+def test_legacy_comparison_allows_fused_current_but_not_fused_baseline():
+    current, baseline = report_pair()
+    current["configuration"]["fusion"] = "ln_bwd"
+    assert driver.compare_reports(current, baseline)
+    baseline["configuration"]["fusion"] = "ln_fwd"
+    with pytest.raises(ValueError, match="baseline must have fusion disabled"):
+        driver.compare_reports(current, baseline)

@@ -8,6 +8,7 @@ No optimizer update is performed; every training iteration uses identical weight
 import argparse
 import csv
 import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
@@ -56,6 +57,12 @@ def parser():
         "--parameter-dtype", choices=("fp32", "fp16", "bf16"), default="fp32"
     )
     p.add_argument("--with-residual", action="store_true")
+    p.add_argument(
+        "--fusion",
+        choices=("off", "ln_fwd", "residual_fwd", "ln_bwd", "ln_fwd_bwd", "residual_fwd_bwd"),
+        default="off",
+        help="opt-in per-block fusion for native/wrapper implementations; legacy requires off",
+    )
     p.add_argument("--deterministic", action="store_true")
     p.add_argument("--seed", type=int, default=1729)
     p.add_argument("--device", type=int, default=0, help="logical CUDA device index")
@@ -112,6 +119,8 @@ def configuration(args):
         raise ValueError("invalid intermediate size or FlashAttention head geometry")
     if args.device < 0:
         raise ValueError("device must be nonnegative")
+    if args.implementation == "legacy" and args.fusion != "off":
+        raise ValueError("legacy implementation does not support fusion")
     if args.implementation == "wrapper" and args.layout != "fixed":
         raise ValueError(
             "the per-sample wrapper is fixed-only; use native for packed state"
@@ -129,7 +138,7 @@ def configuration(args):
     xl = [m - q + 1 for m, q in zip(ml, ql)]
     if any(x <= 0 for x in xl) or max(sum(ml), sum(ql)) > 2**31 - 1:
         raise ValueError(
-            "NCSE memory must be at least query length, with int32-compatible totals"
+            "autoregressive memory must be at least query length, with int32-compatible totals"
         )
     return dict(
         implementation=args.implementation,
@@ -147,6 +156,7 @@ def configuration(args):
         input_dtype=args.input_dtype,
         parameter_dtype=args.parameter_dtype,
         with_residual=args.with_residual,
+        fusion=args.fusion,
         deterministic=args.deterministic,
         seed=args.seed,
         dropout=0.0,
@@ -281,6 +291,8 @@ def hardware_metadata(torch, flash, device):
             pytorch=torch.__version__,
             cuda=torch.version.cuda,
             flash_attention=flash.__version__,
+            triton=(getattr(importlib.import_module("triton"), "__version__", None)
+                    if importlib.util.find_spec("triton") else None),
             python=platform.python_version(),
             platform=platform.platform(),
             cpu_threads=torch.get_num_threads(),
@@ -336,10 +348,12 @@ def compare_reports(current, baseline):
     ):
         raise ValueError("baseline comparison requires clean source checkouts")
     a, b = current["configuration"], baseline["configuration"]
-    if {k: v for k, v in a.items() if k != "implementation"} != {
-        k: v for k, v in b.items() if k != "implementation"
+    if {k: v for k, v in a.items() if k not in ("implementation", "fusion")} != {
+        k: v for k, v in b.items() if k not in ("implementation", "fusion")
     }:
         raise ValueError("comparison workloads or measurement settings differ")
+    if b.get("fusion", "off") != "off":
+        raise ValueError("legacy baseline must have fusion disabled")
     if (
         b["implementation"] != "legacy"
         or baseline["metadata"]["source"]["commit"] != BASELINE_COMMIT
@@ -401,6 +415,7 @@ def write_reports(report, output):
         "depth",
         "seed",
         "with_residual",
+        "fusion",
         "deterministic",
         "warmup",
         "iterations",
@@ -440,7 +455,7 @@ def write_reports(report, output):
 def print_summary(report):
     cfg, hw = report["configuration"], report["metadata"]["hardware"]
     print(
-        f"{hw['gpu_name']} | {cfg['implementation']} {cfg['layout']} {cfg['mode']} | depth={cfg['depth']}"
+        f"{hw['gpu_name']} | {cfg['implementation']} {cfg['layout']} {cfg['mode']} | depth={cfg['depth']} | fusion={cfg['fusion']}"
     )
     print(
         "scope                    median ms     p10 / p90 ms      samples/s      tokens/s    peak MiB"
@@ -474,7 +489,8 @@ def build_workload(torch, vt, cfg, device):
     blocks = torch.nn.ModuleList(
         [
             vt.create_memory_query_block(
-                cfg["emb_dim"], cfg["intermediate_size"], cfg["num_heads"]
+                cfg["emb_dim"], cfg["intermediate_size"], cfg["num_heads"],
+                **({} if legacy else {"fusion": cfg["fusion"]})
             ).to(device=device, dtype=dtype[cfg["parameter_dtype"]])
             for _ in range(cfg["depth"])
         ]
@@ -491,7 +507,12 @@ def build_workload(torch, vt, cfg, device):
         cfg["x_prefix_lengths"][0],
     )
     if fixed:
-        layout = vt.FixedMemoryQueryLayout.ncse(
+        layout_factory = (
+            vt.FixedMemoryQueryLayout.ncse
+            if legacy
+            else vt.FixedMemoryQueryLayout.autoregressive
+        )
+        layout = layout_factory(
             xp, sq, **({} if legacy else dict(batch_size=b))
         )
         shape = (b, sm + 1 + sq, e)

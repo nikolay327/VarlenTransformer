@@ -21,7 +21,7 @@ class CrossMHA(nn.Module):
     Fixed inputs: q=(B,Sq,E), kv=(B,Sk,E). Packed inputs: q=(Tq,E),
     kv=(Tk,E), plus all four sequence arguments. Causal masking uses the
     native bottom-right alignment, including zero attention for fully masked
-    rows when Sq>Sk. Offset contents are a caller contract; no host sync occurs.
+    rows when Sq>Sk.
     """
 
     def __init__(
@@ -51,6 +51,20 @@ class CrossMHA(nn.Module):
         self.Wkv = nn.Linear(emb_dim, 2 * emb_dim)
         self.out_proj = nn.Linear(emb_dim, emb_dim)
 
+    def validate_inputs(
+        self,
+        q: Tensor,
+        kv: Tensor,
+        cu_seqlens_q: Tensor | None = None,
+        cu_seqlens_k: Tensor | None = None,
+        max_seqlen_q: int | None = None,
+        max_seqlen_k: int | None = None,
+    ) -> None:
+        """Check query/key shapes, dtypes, and sequence metadata."""
+        validate_cross_attention_input(
+            q, kv, self.emb_dim, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
+        )
+
     def forward(
         self,
         q: Tensor,
@@ -60,9 +74,6 @@ class CrossMHA(nn.Module):
         max_seqlen_q: int | None = None,
         max_seqlen_k: int | None = None,
     ) -> Tensor:
-        validate_cross_attention_input(
-            q, kv, self.emb_dim, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
-        )
         projected_q = self.Wq(q).reshape(*q.shape[:-1], self.num_heads, self.head_dim)
         projected_kv = self.Wkv(kv).reshape(
             *kv.shape[:-1], 2, self.num_heads, self.head_dim

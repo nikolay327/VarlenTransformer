@@ -55,7 +55,7 @@ def test_rectangular_bottom_right_geometry_and_zero_rows(sq, sk):
     assert torch.isfinite(q.grad).all() and torch.isfinite(kv.grad).all()
 
 
-def test_ncse_geometry_has_exact_allowed_prefixes():
+def test_autoregressive_geometry_has_exact_allowed_prefixes():
     t, d = 3, 4
     q = torch.zeros(1, d, 1, 1)
     kv = torch.zeros(1, t + d - 1, 2, 1, 1)
@@ -131,7 +131,7 @@ def test_cross_validation(cross_reference_backend, case):
         if case == "offset_dtype":
             metadata["cu_seqlens_k"] = metadata["cu_seqlens_k"].float()
     with pytest.raises(ValueError):
-        module(q, kv, **metadata)
+        module.validate_inputs(q, kv, **metadata)
 
 
 @pytest.mark.parametrize("args", [(0, 2), (8, 0), (17, 2), (257, 1)])

@@ -1,10 +1,4 @@
-"""
-Custom implementation of a bidirectional/causal transformer block with fixed/variable sequence length input
-using optimized GPU kernels, flash_attn.flash_attn_qkvpacked_func and flash_attn.flash_attn_varlen_qkvpacked_func.
-See https://github.com/dao-ailab/flash-attention
-
-Input, weights, and biases are casted to bf16, while layer_norm computations are kept in fp32 for stability.
-"""
+"""BF16 self-attention blocks with FP32 LayerNorm and custom backward regions."""
 
 from typing import Optional, Tuple
 
@@ -14,6 +8,7 @@ from torch import Tensor
 from torch.autograd.function import once_differentiable
 
 from ._validation import validate_attention_input
+from . import _fusion
 
 try:
     from flash_attn import flash_attn_qkvpacked_func, flash_attn_varlen_qkvpacked_func
@@ -27,9 +22,6 @@ def _to_bf16(x: Tensor) -> Tensor:
     return x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
 
 
-# Dropout layer customized to add more flexibility later.
-# TODO: add an option for epoch-based and fid-/bid-based seed for mask generation.
-# Generating the mask outside the fwd and bwd (inside the main class body) is an option.
 def _dropout_fwd(x: Tensor, p: float, training: bool) -> tuple[Tensor, Tensor]:
     if (not training) or p == 0.0:
         return x, torch.empty(0, device=x.device, dtype=torch.bool)
@@ -73,7 +65,6 @@ def _linear_bwd(
             out_dtype=torch.float32,
         ).squeeze(0)
     else:
-        # CPU dispatch permits testing the surrounding math without a CUDA kernel.
         grad_w = gy2.float().transpose(0, 1).matmul(x2.float())
     grad_b = gy2.sum(dim=0, dtype=torch.float32)
 
@@ -95,7 +86,11 @@ def _layernorm_fwd_fp32(
     weight: Tensor,
     bias: Tensor,
     eps: float,
+    fusion: str = "off",
 ):
+    fused = _fusion.layernorm_forward(x_bf16, weight, bias, eps, fusion)
+    if fused is not None:
+        return fused
     x_fp32 = x_bf16.float()
     w_fp32 = weight.float()
     b_fp32 = bias.float()
@@ -113,7 +108,13 @@ def _layernorm_bwd_fp32(
     rstd_fp32: Tensor,
     weight: Tensor,
     bias: Tensor,
+    fusion: str = "off",
 ):
+    fused = _fusion.layernorm_backward(
+        grad_y, x_bf16, mean_fp32, rstd_fp32, weight, bias, fusion
+    )
+    if fused is not None:
+        return fused
     grad_x_fp32, grad_w_fp32, grad_b_fp32 = (
         torch.ops.aten.native_layer_norm_backward.default(
             grad_y.float(),
@@ -130,7 +131,7 @@ def _layernorm_bwd_fp32(
 
 
 @torch.library.custom_op(
-    "legendblock::pre_attn_qkv", mutates_args=(), device_types=("cpu", "cuda")
+    "varlen_transformer::pre_attn_qkv", mutates_args=(), device_types=("cpu", "cuda")
 )
 def pre_attn_qkv(
     hidden_states: Tensor,
@@ -144,16 +145,20 @@ def pre_attn_qkv(
     norm_eps: float,
     num_heads: int,
     head_dim: int,
+    fusion: str = "off",
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     hs = _to_bf16(hidden_states)
     res = _to_bf16(residual)
 
     dropped1, mask1 = _dropout_fwd(hs, resid_dropout_p, training)
-    residual1 = res + dropped1
-
-    ln_out, mean, rstd = _layernorm_fwd_fp32(
-        residual1, norm_weight, norm_bias, norm_eps
-    )
+    fused = _fusion.residual_forward(res, dropped1, norm_weight, norm_bias, norm_eps, fusion=fusion)
+    if fused is None:
+        residual1 = res + dropped1
+        ln_out, mean, rstd = _layernorm_fwd_fp32(
+            residual1, norm_weight, norm_bias, norm_eps, fusion
+        )
+    else:
+        residual1, ln_out, mean, rstd = fused
 
     wqkv_weight_bf16 = _to_bf16(wqkv_weight)
     wqkv_bias_bf16 = _to_bf16(wqkv_bias)
@@ -176,6 +181,7 @@ def _(
     norm_eps: float,
     num_heads: int,
     head_dim: int,
+    fusion: str = "off",
 ):
     qkv = hidden_states.new_empty(
         (*hidden_states.shape[:-1], 3, num_heads, head_dim), dtype=torch.bfloat16
@@ -205,6 +211,7 @@ def _pre_setup_context(ctx, inputs, output):
         norm_eps,
         num_heads,
         head_dim,
+        fusion,
     ) = inputs
 
     qkv, residual1, mask1, mean, rstd, ln_out = output
@@ -229,6 +236,7 @@ def _pre_setup_context(ctx, inputs, output):
     ctx.norm_eps = norm_eps
     ctx.num_heads = num_heads
     ctx.head_dim = head_dim
+    ctx.fusion = fusion
 
 
 @once_differentiable
@@ -264,7 +272,7 @@ def _pre_backward(ctx, grad_qkv, grad_residual1, *unused_aux_grads):
     )
 
     grad_residual1_from_ln, grad_norm_w, grad_norm_b = _layernorm_bwd_fp32(
-        grad_ln_out, residual1, mean, rstd, norm_weight, norm_bias
+        grad_ln_out, residual1, mean, rstd, norm_weight, norm_bias, ctx.fusion
     )
 
     grad_residual1_total = grad_residual1.float() + grad_residual1_from_ln
@@ -289,6 +297,7 @@ def _pre_backward(ctx, grad_qkv, grad_residual1, *unused_aux_grads):
         None,
         None,
         None,
+        None,
     )
 
 
@@ -296,7 +305,7 @@ pre_attn_qkv.register_autograd(_pre_backward, setup_context=_pre_setup_context)
 
 
 @torch.library.custom_op(
-    "legendblock::post_attn_mlp", mutates_args=(), device_types=("cpu", "cuda")
+    "varlen_transformer::post_attn_mlp", mutates_args=(), device_types=("cpu", "cuda")
 )
 def post_attn_mlp(
     attn_out: Tensor,
@@ -312,6 +321,7 @@ def post_attn_mlp(
     resid_dropout_p: float,
     training: bool,
     norm_eps: float,
+    fusion: str = "off",
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     attn_out_bf16 = _to_bf16(attn_out)
     residual1_bf16 = _to_bf16(residual1)
@@ -321,11 +331,16 @@ def post_attn_mlp(
     attn_proj = _linear_fwd(attn_out_bf16, out_proj_weight_bf16, out_proj_bias_bf16)
 
     dropped2, mask2 = _dropout_fwd(attn_proj, resid_dropout_p, training)
-    residual2 = residual1_bf16 + dropped2
-
-    ln_out, mean, rstd = _layernorm_fwd_fp32(
-        residual2, norm_weight, norm_bias, norm_eps
+    fused = _fusion.residual_forward(
+        residual1_bf16, dropped2, norm_weight, norm_bias, norm_eps, fusion=fusion
     )
+    if fused is None:
+        residual2 = residual1_bf16 + dropped2
+        ln_out, mean, rstd = _layernorm_fwd_fp32(
+            residual2, norm_weight, norm_bias, norm_eps, fusion
+        )
+    else:
+        residual2, ln_out, mean, rstd = fused
 
     fc1_weight_bf16 = _to_bf16(fc1_weight)
     fc1_bias_bf16 = _to_bf16(fc1_bias)
@@ -354,6 +369,7 @@ def _(
     resid_dropout_p: float,
     training: bool,
     norm_eps: float,
+    fusion: str = "off",
 ):
     out = attn_out.new_empty(attn_out.shape, dtype=torch.bfloat16)
     residual2 = residual1.new_empty(residual1.shape, dtype=torch.bfloat16)
@@ -390,6 +406,7 @@ def _post_setup_context(ctx, inputs, output):
         resid_dropout_p,
         training,
         norm_eps,
+        fusion,
     ) = inputs
 
     out, residual2, mask2, mean, rstd, ln_out, gelu_in, gelu_out = output
@@ -418,6 +435,7 @@ def _post_setup_context(ctx, inputs, output):
     ctx.resid_dropout_p = resid_dropout_p
     ctx.training = training
     ctx.norm_eps = norm_eps
+    ctx.fusion = fusion
 
 
 @once_differentiable
@@ -466,7 +484,7 @@ def _post_backward(ctx, grad_out, grad_residual2, *unused_aux_grads):
     )
 
     grad_residual2_from_ln, grad_norm_w, grad_norm_b = _layernorm_bwd_fp32(
-        grad_ln_out, residual2, mean, rstd, norm_weight, norm_bias
+        grad_ln_out, residual2, mean, rstd, norm_weight, norm_bias, ctx.fusion
     )
     grad_residual2_total = grad_residual2_total + grad_residual2_from_ln
 
@@ -494,6 +512,7 @@ def _post_backward(ctx, grad_out, grad_residual2, *unused_aux_grads):
         None,
         None,
         None,
+        None,
     )
 
 
@@ -505,11 +524,11 @@ class Block(nn.Module):
 
     Chain blocks by passing both returned tensors to the next block. After the
     last block, add the branch to the residual before the final normalization.
-    Attention requires CUDA; CPU dispatch of the two custom ops is for tests.
     """
 
-    def __init__(self, emb_dim, mixer_cls, mlp_cls, resid_dropout1, resid_dropout2):
+    def __init__(self, emb_dim, mixer_cls, mlp_cls, resid_dropout1, resid_dropout2, *, fusion="off"):
         super(Block, self).__init__()
+        self.fusion = fusion
 
         self.mixer = mixer_cls(emb_dim)
         self.mlp = mlp_cls(emb_dim)
@@ -520,13 +539,23 @@ class Block(nn.Module):
         self.dropout1 = nn.Dropout(resid_dropout1)
         self.dropout2 = nn.Dropout(resid_dropout2)
 
-    def forward(
+    @property
+    def fusion(self) -> str:
+        """Fusion mode used by subsequent forward calls."""
+        return self._fusion_mode
+
+    @fusion.setter
+    def fusion(self, mode: str):
+        self._fusion_mode = _fusion.validate_mode(mode)
+
+    def validate_inputs(
         self,
         hidden_states: Tensor,
         residual: Optional[Tensor] = None,
         cu_seqlens: Optional[Tensor] = None,
         max_seqlen: Optional[int] = None,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> None:
+        """Check hidden states, residuals, and fixed or packed metadata."""
         validate_attention_input(
             hidden_states, self.mixer.emb_dim, cu_seqlens, max_seqlen
         )
@@ -540,12 +569,21 @@ class Block(nn.Module):
                 )
             if not residual.is_floating_point():
                 raise ValueError("residual must have a floating-point dtype")
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        residual: Optional[Tensor] = None,
+        cu_seqlens: Optional[Tensor] = None,
+        max_seqlen: Optional[int] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        fusion = self.fusion
         residual_in = (
             residual if residual is not None else torch.zeros_like(hidden_states)
         )
 
         # dropout -> resid -> qkv
-        qkv, residual1, *_ = torch.ops.legendblock.pre_attn_qkv(
+        qkv, residual1, *_ = torch.ops.varlen_transformer.pre_attn_qkv(
             hidden_states,
             residual_in,
             self.norm_attn.weight,
@@ -557,6 +595,7 @@ class Block(nn.Module):
             self.norm_attn.eps,
             self.mixer.num_heads,
             self.mixer.head_dim,
+            fusion,
         )
 
         # qkv -> attn
@@ -590,7 +629,7 @@ class Block(nn.Module):
         attn_out = attn_out.reshape(*hidden_states.shape[:-1], self.mixer.emb_dim)
 
         # linear -> drop -> resid -> mlp
-        out, residual2, *_ = torch.ops.legendblock.post_attn_mlp(
+        out, residual2, *_ = torch.ops.varlen_transformer.post_attn_mlp(
             attn_out,
             residual1,
             self.mixer.out_proj.weight,
@@ -604,41 +643,7 @@ class Block(nn.Module):
             self.dropout2.p,
             self.training,
             self.norm_mlp.eps,
+            fusion,
         )
 
         return out, residual2
-
-
-# Eager reference without the custom ops or their explicit mixed-precision policy.
-class Block_(nn.Module):
-    def __init__(self, emb_dim, mixer_cls, mlp_cls, resid_dropout1, resid_dropout2):
-        super(Block_, self).__init__()
-
-        self.mixer = mixer_cls(emb_dim)
-        self.mlp = mlp_cls(emb_dim)
-
-        self.norm_attn = nn.LayerNorm(emb_dim)
-        self.norm_mlp = nn.LayerNorm(emb_dim)
-
-        self.dropout1 = nn.Dropout(resid_dropout1)
-        self.dropout2 = nn.Dropout(resid_dropout2)
-
-    def forward(
-        self,
-        hidden_states: Tensor,
-        residual: Optional[Tensor] = None,
-        cu_seqlens: Optional[Tensor] = None,
-        max_seqlen: Optional[int] = None,
-    ) -> Tuple[Tensor, Tensor]:
-        # prenorm path
-        dropped = self.dropout1(hidden_states)
-        residual = (residual + dropped) if residual is not None else dropped
-
-        hidden_states = self.norm_attn(residual)
-        hidden_states = self.mixer(hidden_states, cu_seqlens, max_seqlen)
-        residual = residual + self.dropout2(hidden_states)
-
-        hidden_states = self.norm_mlp(residual)
-        hidden_states = self.mlp(hidden_states)
-
-        return hidden_states, residual

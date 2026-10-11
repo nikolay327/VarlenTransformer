@@ -34,7 +34,7 @@ def test_wheel_contains_importable_modules_and_license_metadata(distributions):
         for module in (
             "__init__",
             "block",
-            "cls",
+            "factories",
             "mha",
             "mlp",
             "_validation",
@@ -43,8 +43,11 @@ def test_wheel_contains_importable_modules_and_license_metadata(distributions):
             "memory_query",
             "stack",
             "_memory_ops",
+            "_fusion",
+            "_triton_norm",
         ):
             assert f"varlen_transformer/{module}.py" in names
+        assert "varlen_transformer/cls.py" not in names
         assert not any("/kernels/" in name or "__pycache__" in name for name in names)
         metadata = email.message_from_bytes(
             archive.read(
@@ -53,7 +56,7 @@ def test_wheel_contains_importable_modules_and_license_metadata(distributions):
         )
         assert (
             metadata["Name"] == "VarlenTransformer"
-            and metadata["License-Expression"] == "MIT"
+            and metadata["License-Expression"] == "MIT AND BSD-3-Clause"
         )
         assert metadata["Requires-Python"] == ">=3.10"
         requirements = [Requirement(r) for r in metadata.get_all("Requires-Dist")]
@@ -72,6 +75,7 @@ def test_wheel_contains_importable_modules_and_license_metadata(distributions):
         )
         assert any(name.endswith("/licenses/LICENSE") for name in names)
         assert any(name.endswith("/licenses/THIRD_PARTY_NOTICES.md") for name in names)
+        assert any(name.endswith("/licenses/third_party/PyTorch-LICENSE") for name in names)
 
 
 def test_sdist_includes_tests_docs_and_workflows(distributions):
@@ -81,6 +85,7 @@ def test_sdist_includes_tests_docs_and_workflows(distributions):
         for suffix in (
             "/README.md",
             "/LICENSE",
+            "/third_party/PyTorch-LICENSE",
             "/tests/test_cuda.py",
             "/tests/test_custom_ops.py",
             "/benchmarks/profile_memory_query.py",
@@ -118,14 +123,17 @@ def test_installed_wheel_imports_without_optional_flash(distributions, tmp_path)
 import importlib.abc
 from pathlib import Path
 import sys
-class HideFlash(importlib.abc.MetaPathFinder):
+class HideOptionalBackends(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname == "flash_attn":
-            raise ModuleNotFoundError("FlashAttention deliberately hidden", name="flash_attn")
-sys.meta_path.insert(0, HideFlash())
+        if fullname in {"flash_attn", "triton"}:
+            raise ModuleNotFoundError("Optional backend deliberately hidden", name=fullname)
+sys.meta_path.insert(0, HideOptionalBackends())
 sys.path.insert(0, sys.argv[1])
 import torch
 import varlen_transformer as vt
+from varlen_transformer import _fusion
+assert "triton" not in sys.modules
+assert "varlen_transformer._triton_norm" not in sys.modules
 assert Path(vt.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve())
 assert set(vt.__all__) == {"Block", "MHA", "MLP", "create_block", "CrossMHA",
     "MemoryQueryBlock", "FixedMemoryQueryLayout", "PackedMemoryQueryLayout", "create_memory_query_block", "FixedMemoryQueryStack",
