@@ -356,7 +356,7 @@ def test_adapter_dropout_serialization_and_optimizer(
     assert not torch.equal(before, other.blocks[0].cross_mixer.Wkv.weight)
 
 
-def test_adapter_and_fixed_metadata_validation():
+def test_adapter_and_fixed_metadata_validation(memory_reference_backend):
     with pytest.raises(TypeError):
         FixedMemoryQueryLayout.autoregressive(3, 4)
     with pytest.raises(ValueError):
@@ -364,6 +364,7 @@ def test_adapter_and_fixed_metadata_validation():
     with pytest.raises(ValueError):
         FixedMemoryQueryStack([])
     layout = FixedMemoryQueryLayout.autoregressive(3, 4, batch_size=2)
+    adapter = FixedMemoryQueryStack([MemoryQueryBlock(16, 32, 2)])
     for value in (
         torch.randn(11, 16),
         torch.randn(1, 11, 16),
@@ -371,12 +372,10 @@ def test_adapter_and_fixed_metadata_validation():
         torch.ones(2, 11, 16, dtype=torch.int64),
     ):
         with pytest.raises(ValueError):
-            pack_fixed_memory_query(value, layout)
+            adapter.validate_inputs(value, layout=layout)
     for value in (torch.randn(22), torch.empty(22, 0), torch.randn(21, 16)):
         with pytest.raises(ValueError):
-            unpack_fixed_memory_query(value, layout)
+            layout.validate(value, 16)
     packed = PackedMemoryQueryLayout.autoregressive([3, 3], [4, 4])
     with pytest.raises(ValueError):
-        pack_fixed_memory_query(torch.randn(2, 11, 16), packed)
-    with pytest.raises(ValueError):
-        unpack_fixed_memory_query(torch.randn(22, 16), packed)
+        adapter.validate_inputs(torch.randn(2, 11, 16), layout=packed)

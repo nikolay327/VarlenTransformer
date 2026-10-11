@@ -50,6 +50,15 @@ class MHA(nn.Module):
         self.Wqkv = nn.Linear(self.emb_dim, 3 * self.emb_dim)
         self.out_proj = nn.Linear(self.emb_dim, self.emb_dim)
 
+    def validate_inputs(
+        self,
+        x: Tensor,
+        cu_seqlens: Optional[Tensor] = None,
+        max_seqlen: Optional[int] = None,
+    ) -> None:
+        """Check input shape, dtype, and sequence metadata."""
+        validate_attention_input(x, self.emb_dim, cu_seqlens, max_seqlen)
+
     def forward(
         self,
         x: Tensor,
@@ -57,7 +66,6 @@ class MHA(nn.Module):
         max_seqlen: Optional[int] = None,
     ) -> Tensor:
         """Attend to fixed ``(B, S, E)`` or packed ``(T, E)`` input."""
-        validate_attention_input(x, self.emb_dim, cu_seqlens, max_seqlen)
         qkv = self.Wqkv(x)
         qkv = qkv.reshape(*x.shape[:-1], 3, self.num_heads, self.head_dim).contiguous()
         if cu_seqlens is not None:

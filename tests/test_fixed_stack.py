@@ -77,7 +77,7 @@ def test_native_rejects_per_sample_shape_and_wrapper_can_return_flat(
     block = MemoryQueryBlock(16, 32, 2)
     x = torch.randn(2, 11, 16)
     with pytest.raises(ValueError, match="FixedMemoryQueryStack"):
-        block(x, layout=layout)
+        block.validate_inputs(x, layout=layout)
     adapter = FixedMemoryQueryStack([block])
     h, r = adapter(x, layout=layout, return_stream_major=True)
     assert h.shape == r.shape == (layout.total_tokens, 16)

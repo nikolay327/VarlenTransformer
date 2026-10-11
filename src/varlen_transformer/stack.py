@@ -11,18 +11,7 @@ from .memory_query import MemoryQueryBlock
 
 def pack_fixed_memory_query(state: Tensor, layout: FixedMemoryQueryLayout) -> Tensor:
     """Convert (B,Sm+1+Sq,E) to flat [all M;all V;all Q], preserving gradients."""
-    if not isinstance(layout, FixedMemoryQueryLayout):
-        raise ValueError("fixed packing requires FixedMemoryQueryLayout")
-    sm, sq, b = layout.memory_length, layout.query_length, layout.batch_size
-    if (
-        state.ndim != 3
-        or state.shape[:2] != (b, sm + 1 + sq)
-        or not state.is_floating_point()
-        or state.shape[-1] == 0
-    ):
-        raise ValueError(
-            f"per-sample state must have floating shape ({b},{sm + 1 + sq},E)"
-        )
+    sm = layout.memory_length
     e = state.shape[-1]
     return torch.cat(
         (state[:, :sm].reshape(-1, e), state[:, sm], state[:, sm + 1 :].reshape(-1, e)),
@@ -32,13 +21,6 @@ def pack_fixed_memory_query(state: Tensor, layout: FixedMemoryQueryLayout) -> Te
 
 def unpack_fixed_memory_query(state: Tensor, layout: FixedMemoryQueryLayout) -> Tensor:
     """Convert flat stream-major state to (B,Sm+1+Sq,E), preserving gradients."""
-    if not isinstance(layout, FixedMemoryQueryLayout):
-        raise ValueError("fixed unpacking requires FixedMemoryQueryLayout")
-    if state.ndim != 2 or state.shape[-1] == 0:
-        raise ValueError(
-            "unpacking requires a flat stream-major tensor with nonzero width"
-        )
-    layout.validate(state, state.shape[-1])
     n, b, e = layout.num_memory_tokens, layout.batch_size, state.shape[-1]
     return torch.cat(
         (
@@ -67,6 +49,24 @@ class FixedMemoryQueryStack(nn.Module):
             raise ValueError("blocks must contain at least one MemoryQueryBlock")
         self.blocks = nn.ModuleList(blocks)
 
+    def validate_inputs(
+        self,
+        hidden_states: Tensor,
+        residual: Tensor | None = None,
+        *,
+        layout: FixedMemoryQueryLayout,
+    ) -> None:
+        """Check per-sample state and residual against the first block and layout."""
+        if not isinstance(layout, FixedMemoryQueryLayout):
+            raise ValueError("fixed stack requires FixedMemoryQueryLayout")
+        layout.validate_per_sample(hidden_states, self.blocks[0].memory_mixer.emb_dim)
+        if residual is not None and (
+            residual.shape != hidden_states.shape
+            or residual.device != hidden_states.device
+            or not residual.is_floating_point()
+        ):
+            raise ValueError("residual must match the floating hidden-state shape and device")
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -75,11 +75,6 @@ class FixedMemoryQueryStack(nn.Module):
         layout: FixedMemoryQueryLayout,
         return_stream_major: bool = False,
     ) -> tuple[Tensor, Tensor]:
-        if residual is not None and (
-            residual.shape != hidden_states.shape
-            or residual.device != hidden_states.device
-        ):
-            raise ValueError("residual must match hidden states in shape and device")
         h = pack_fixed_memory_query(hidden_states, layout)
         r = None if residual is None else pack_fixed_memory_query(residual, layout)
         for block in self.blocks:

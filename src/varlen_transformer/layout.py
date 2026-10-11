@@ -54,6 +54,7 @@ class FixedMemoryQueryLayout:
         return self.num_memory_tokens + self.batch_size + self.num_query_tokens
 
     def validate(self, hidden_states: Tensor, emb_dim: int):
+        """Check a flat stream-major state against this layout."""
         expected = self.total_tokens
         if (
             hidden_states.ndim != 2
@@ -64,6 +65,17 @@ class FixedMemoryQueryLayout:
                 f"native fixed state must have floating stream-major shape ({expected}, {emb_dim}); "
                 "use FixedMemoryQueryStack for per-sample (B,S,E) input"
             )
+
+    def validate_per_sample(self, hidden_states: Tensor, emb_dim: int):
+        """Check per-sample [M;V;Q] state against this layout."""
+        expected = (self.batch_size, self.memory_length + 1 + self.query_length, emb_dim)
+        if (
+            hidden_states.ndim != 3
+            or hidden_states.shape != expected
+            or emb_dim <= 0
+            or not hidden_states.is_floating_point()
+        ):
+            raise ValueError(f"per-sample state must have floating shape {expected}")
 
 
 @dataclass(frozen=True)
@@ -315,6 +327,7 @@ class PackedMemoryQueryLayout:
         return result
 
     def validate(self, hidden_states: Tensor, emb_dim: int):
+        """Check packed state shape, dtype, and metadata device."""
         if (
             hidden_states.ndim != 2
             or hidden_states.shape != (self.total_tokens, emb_dim)

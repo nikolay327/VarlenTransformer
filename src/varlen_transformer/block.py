@@ -509,13 +509,14 @@ class Block(nn.Module):
         self.dropout1 = nn.Dropout(resid_dropout1)
         self.dropout2 = nn.Dropout(resid_dropout2)
 
-    def forward(
+    def validate_inputs(
         self,
         hidden_states: Tensor,
         residual: Optional[Tensor] = None,
         cu_seqlens: Optional[Tensor] = None,
         max_seqlen: Optional[int] = None,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> None:
+        """Check hidden states, residuals, and fixed or packed metadata."""
         validate_attention_input(
             hidden_states, self.mixer.emb_dim, cu_seqlens, max_seqlen
         )
@@ -529,6 +530,14 @@ class Block(nn.Module):
                 )
             if not residual.is_floating_point():
                 raise ValueError("residual must have a floating-point dtype")
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        residual: Optional[Tensor] = None,
+        cu_seqlens: Optional[Tensor] = None,
+        max_seqlen: Optional[int] = None,
+    ) -> Tuple[Tensor, Tensor]:
         residual_in = (
             residual if residual is not None else torch.zeros_like(hidden_states)
         )

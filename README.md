@@ -170,6 +170,22 @@ The block accepts floating-point input and parameter storage dtypes and computes
 
 Each block invokes FlashAttention three times: memory self-attention, volume cross-attention, and density cross-attention. The K/V projection is shared between the two cross-attention paths.
 
+## Input preparation
+
+`Block`, `MHA`, `CrossMHA`, `MemoryQueryBlock`, and `FixedMemoryQueryStack`
+provide `validate_inputs(...)` for checking tensor shapes, dtypes, residuals,
+and sequence metadata during batch preparation. It accepts the tensor and
+sequence arguments used by the corresponding forward method and raises
+`ValueError` for incompatible inputs. Call it when preparing a new input
+structure; training and inference forward methods consume the prepared inputs
+directly.
+
+Layouts check their geometry at construction. `layout.validate(state, emb_dim)`
+checks a flat state, while a fixed layout's `validate_per_sample(state, emb_dim)`
+checks `(B, S_M + 1 + S_Q, E)` storage. The packing and unpacking functions
+operate on these prepared layouts and states. Model dimensions, dropout
+settings are checked when configured.
+
 ## Testing
 
 The tests cover the standard block, cross-attention, mixed-precision custom operations, memory/query layouts, dependency isolation, packing, gradients, and real CUDA integration.

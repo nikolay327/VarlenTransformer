@@ -131,7 +131,7 @@ def test_cross_validation(cross_reference_backend, case):
         if case == "offset_dtype":
             metadata["cu_seqlens_k"] = metadata["cu_seqlens_k"].float()
     with pytest.raises(ValueError):
-        module(q, kv, **metadata)
+        module.validate_inputs(q, kv, **metadata)
 
 
 @pytest.mark.parametrize("args", [(0, 2), (8, 0), (17, 2), (257, 1)])

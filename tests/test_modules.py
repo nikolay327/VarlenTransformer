@@ -337,7 +337,7 @@ def test_attention_input_validation(reference_backend, kind, case):
     elif case == "cu_device":
         cu = cu.to("meta")
     with pytest.raises(ValueError):
-        module(x, cu_seqlens=cu, max_seqlen=maximum)
+        module.validate_inputs(x, cu_seqlens=cu, max_seqlen=maximum)
     assert not reference_backend
 
 
@@ -353,7 +353,7 @@ def test_residual_input_validation(reference_backend, case):
         else torch.ones_like(x, dtype=torch.int64)
     )
     with pytest.raises(ValueError, match="residual"):
-        block(x, residual)
+        block.validate_inputs(x, residual)
     assert not reference_backend
 
 

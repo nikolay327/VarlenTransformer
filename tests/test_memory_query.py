@@ -318,7 +318,7 @@ def test_block_validation(memory_reference_backend, case):
     if case == "residual_dtype":
         residual = x.long()
     with pytest.raises(ValueError):
-        block(x, residual, layout=layout)
+        block.validate_inputs(x, residual, layout=layout)
 
 
 @pytest.mark.parametrize(

@@ -79,13 +79,14 @@ class MemoryQueryBlock(nn.Module):
         self.dropout_sa = nn.Dropout(sa_resid_dropout)
         self.dropout_ca = nn.Dropout(ca_resid_dropout)
 
-    def forward(
+    def validate_inputs(
         self,
         hidden_states: Tensor,
         residual: Tensor | None = None,
         *,
         layout: FixedMemoryQueryLayout | PackedMemoryQueryLayout,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> None:
+        """Check stream-major state and residual against the layout."""
         if not isinstance(layout, (FixedMemoryQueryLayout, PackedMemoryQueryLayout)):
             raise ValueError(
                 "layout must be a FixedMemoryQueryLayout or PackedMemoryQueryLayout"
@@ -99,6 +100,14 @@ class MemoryQueryBlock(nn.Module):
             raise ValueError(
                 "residual must match the floating hidden-state shape and device"
             )
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        residual: Tensor | None = None,
+        *,
+        layout: FixedMemoryQueryLayout | PackedMemoryQueryLayout,
+    ) -> tuple[Tensor, Tensor]:
         residual_in = torch.zeros_like(hidden_states) if residual is None else residual
         n, e = layout.num_memory_tokens, self.memory_mixer.emb_dim
         sa, ca = self.memory_mixer, self.cross_mixer
