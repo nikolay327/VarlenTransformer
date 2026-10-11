@@ -122,7 +122,7 @@ for block in blocks:
 y = h + residual
 ```
 
-`FixedMemoryQueryLayout(memory_length, query_length, x_prefix_length, batch_size=B)` provides the equivalent explicit constructor. Incompatible autoregressive lengths are rejected. `CrossMHA` remains available for general rectangular attention without this constraint.
+`FixedMemoryQueryLayout(memory_length, query_length, x_prefix_length, batch_size=B)` provides the equivalent explicit constructor. Incompatible autoregressive lengths are rejected. `CrossMHA` supports general rectangular attention independently of this layout.
 
 ### Fixed-batch stack adapter
 
@@ -170,28 +170,15 @@ The block accepts floating-point input and parameter storage dtypes and computes
 
 Each block invokes FlashAttention three times: memory self-attention, volume cross-attention, and density cross-attention. The K/V projection is shared between the two cross-attention paths.
 
-## Input preparation
+## Input validation
 
-`Block`, `MHA`, `CrossMHA`, `MemoryQueryBlock`, and `FixedMemoryQueryStack`
-provide `validate_inputs(...)` for checking tensor shapes, dtypes, residuals,
-and sequence metadata during batch preparation. It accepts the tensor and
-sequence arguments used by the corresponding forward method and raises
-`ValueError` for incompatible inputs. Call it when preparing a new input
-structure; training and inference forward methods consume the prepared inputs
-directly.
+`Block`, `MHA`, `CrossMHA`, `MemoryQueryBlock`, and `FixedMemoryQueryStack` expose `validate_inputs(...)` for checking tensor shapes, dtypes, residuals, and sequence metadata. Validation is performed explicitly during input preparation rather than inside `forward()`.
 
-Layouts check their geometry at construction. `layout.validate(state, emb_dim)`
-checks a flat state, while a fixed layout's `validate_per_sample(state, emb_dim)`
-checks `(B, S_M + 1 + S_Q, E)` storage. The packing and unpacking functions
-operate on these prepared layouts and states. Model dimensions, dropout
-settings, and fusion modes are checked when configured.
+Layout constructors validate their geometry. `layout.validate(state, emb_dim)` checks flat stream-major storage; `FixedMemoryQueryLayout.validate_per_sample(state, emb_dim)` checks `(B, S_M + 1 + S_Q, E)` storage. The packing and unpacking utilities operate on prepared states and layouts.
 
 ## Optional CUDA fusion
 
-Enable LayerNorm and residual normalization fusion through the `fusion` keyword
-on `Block`, `MemoryQueryBlock`, `create_block`, or `create_memory_query_block`.
-Each block has its own configuration, with `off` as the default. This works
-directly in Python scripts and Jupyter notebooks:
+`Block`, `MemoryQueryBlock`, `create_block`, and `create_memory_query_block` accept a `fusion` setting for optional Triton LayerNorm and residual-normalization kernels. The default is `"off"`.
 
 ```python
 from varlen_transformer import create_block, create_memory_query_block
@@ -199,114 +186,79 @@ from varlen_transformer import create_block, create_memory_query_block
 standard = create_block(512, 2048, 8, causal=True, fusion="residual_fwd_bwd").cuda()
 memory_query = create_memory_query_block(512, 2048, 8, fusion="residual_fwd").cuda()
 
-# Change an existing block for subsequent forward calls.
 standard.fusion = "residual_fwd"
-standard.eval()
 ```
 
-Configuration is validated when creating a block or assigning `block.fusion`.
-Each forward passes its mode explicitly to the custom operations, which save it
-for backward. Changing a block's mode does not change graphs already created,
-or another block's mode. `train()` and `eval()` retain the selected mode.
-Fusion settings are runtime configuration and are not included in `state_dict`;
-choose the mode when rebuilding a model before loading its weights.
+Fusion is configured independently for each block. The selected mode is captured for each forward/backward graph and is preserved across `train()` and `eval()`. Fusion settings are not included in `state_dict`.
 
 | Mode | Forward | Backward |
 | --- | --- | --- |
 | `off` | ATen | ATen |
-| `ln_fwd` | Welford LayerNorm | ATen |
-| `residual_fwd` | Residual plus Welford LayerNorm where supported | ATen |
-| `ln_bwd` | ATen | FP32 LayerNorm gradients |
-| `ln_fwd_bwd` | Welford LayerNorm | FP32 LayerNorm gradients |
-| `residual_fwd_bwd` | Residual plus Welford LayerNorm where supported | FP32 LayerNorm gradients |
+| `ln_fwd` | Fused Welford LayerNorm | ATen |
+| `residual_fwd` | Fused residual + Welford LayerNorm | ATen |
+| `ln_bwd` | ATen | Fused FP32 LayerNorm gradients |
+| `ln_fwd_bwd` | Fused Welford LayerNorm | Fused FP32 LayerNorm gradients |
+| `residual_fwd_bwd` | Fused residual + Welford LayerNorm | Fused FP32 LayerNorm gradients |
 
-Forward uses a vectorized Welford reduction and FP32 affine arithmetic. It
-accepts contiguous BF16 inputs with embedding widths from 32 through 4096
-divisible by four. Unsupported widths, layouts, and
-parameter alignment use the existing ATen forward. Backward uses fixed row
-tiles and a bounded second reduction; oversized reductions use ATen.
-MemoryQuery partial residual updates require flat stream-major tensors;
-batched partial updates retain the existing implementation.
+Forward fusion uses a vectorized Welford reduction and FP32 affine arithmetic. The Triton forward kernels support contiguous BF16 inputs with embedding widths divisible by four, from 32 to 4096. Unsupported shapes, layouts, and parameter alignments use the ATen implementation. Backward fusion uses tiled gradient computation followed by a bounded FP32 affine-gradient reduction, with ATen handling unsupported reductions.
 
-Residual sums round to BF16 before FP32 normalization, and gradient outputs
-remain FP32 until the existing custom backward applies its storage-dtype
-boundary. Dropout and its saved masks, RNG advancement, saved tensor ownership,
-FlashAttention, linear operations, and first-order autograd behavior follow the
-existing paths. Compilation and execution errors propagate.
-Dispatch selects kernels using device, dtype, shape, layout, and alignment.
+Residual sums are rounded to BF16 before normalization. MemoryQuery's partial-residual specialization applies to flat stream-major tensors; batched partial updates use the ATen implementation. Dropout, FlashAttention, linear projections, and the existing first-order autograd interfaces are unchanged.
+
+### Compatibility
+
+The fused forward Welford reduction was developed against **PyTorch 2.9.1+cu130**, with **Triton 3.5.1** on an **NVIDIA RTX 5070 Ti Laptop GPU**. The package requirement is `torch>=2.8`; numerical agreement of the optional fused kernels with other PyTorch and Triton releases is evaluated using the CUDA fusion test suite.
+
+Triton is an optional dependency. The standard ATen implementation is used when fusion is disabled or a fusion specialization is unsupported.
 
 ## Testing
 
-The tests cover the standard block, cross-attention, mixed-precision custom operations, memory/query layouts, dependency isolation, packing, gradients, and real CUDA integration.
+The test suite covers fixed and packed attention, standard and MemoryQuery blocks, mixed precision, dependency isolation, custom autograd, gradients, and fusion behavior.
 
 ```bash
 python -m pytest -m "not cuda"
 python -m pytest -m cuda --require-cuda
-python -m pytest --require-cuda
+python -m pytest -m "cuda and fusion" --require-cuda --require-fusion
+python -m pytest --require-cuda --require-fusion
 ```
 
-`--require-cuda` fails when the required GPU or FlashAttention environment is unavailable, rather than silently skipping CUDA tests. GitHub Actions runs CPU tests automatically; the GPU workflow is manually triggered on a compatible self-hosted runner.
+The fusion CUDA tests compare Welford statistics, BF16 rounding, residual updates, backward gradients, dropout/RNG behavior, and repeated optimizer updates against the reference implementation. The `--require-cuda` and `--require-fusion` options enforce the corresponding hardware and backend requirements; `--require-fusion` also checks that fusion tests were collected.
 
-Fusion CUDA tests also carry the `fusion` marker and exercise real kernels,
-strict BF16 forward boundaries, partial-update storage ownership, dropout/RNG,
-parameter gradients, frozen parameters, and repeated optimizer updates.
-They require CUDA, FlashAttention, and Triton; ordinary test runs skip
-them when those optional prerequisites are absent. `--require-fusion` makes
-missing prerequisites fail, so a required fusion validation cannot pass by
-skipping its accelerator tests. CPU fallback and fake-tensor tests always run.
-The tests configure each model through the Python API and observe backend calls
-using test fixtures. They also cover independent block modes, reconfiguration
-between forward and backward, and explicit-mode AOT dispatch.
+The CPU suite runs automatically in GitHub Actions. GPU tests, including required fusion coverage, run through the manually triggered self-hosted GPU workflow on the default branch.
+
+## Benchmarking
+
+### Paired fusion comparisons
+
+`benchmarks/profile_fusion.py` compares `fusion="off"` with a selected fusion mode using identical parameters and inputs. It supports standard causal and bidirectional self-attention and MemoryQuery, fixed and heterogeneous packed layouts, inference, and training.
+
+Measurements use paired, randomized CUDA-event runs and record raw timings, per-run statistics, peak allocated GPU memory, fused-kernel dispatch counts, and hardware/software metadata. Training includes backward and excludes optimizer updates; dropout is disabled for timing.
 
 ```bash
-python -m pytest -q --require-cuda --require-fusion
+python -m benchmarks.profile_fusion --architecture standard_causal --layout fixed --execution train --fusion residual_fwd_bwd --output benchmark-results/fusion-standard.json
+python -m benchmarks.profile_fusion --architecture standard_bidirectional --layout packed --batch-size 3 --sequence-lengths 7,31,127 --fusion ln_bwd --output benchmark-results/fusion-standard-packed.json
+python -m benchmarks.profile_fusion --architecture memory_query --layout fixed --execution train --fusion residual_fwd_bwd --output benchmark-results/fusion-memory-query.json
+python -m benchmarks.profile_fusion --architecture memory_query --layout packed --batch-size 3 --memory-lengths 7,31,127 --query-lengths 3,4,5 --fusion ln_bwd --output benchmark-results/fusion-memory-query-packed.json
 ```
 
-## Local CUDA benchmarking and visualization
+Model dimensions are configurable using `--emb-dim`, `--batch-size`, `--depth`, and `--num-heads`. The default fixed configuration uses embedding dimension 128, batch size 8, depth 4, and four attention heads. The benchmark verifies fused-kernel dispatch during an untimed run.
 
-`benchmarks/profile_memory_query.py` benchmarks inference and forward/backward
-training using CUDA events. It reports median and p10/p90 latency, throughput,
-GPU memory allocation, and hardware/software metadata. Setup and initialization
-are excluded from timings; training includes backward but not optimizer steps.
+### MemoryQuery profiling
 
-Examples from the repository root:
+`benchmarks/profile_memory_query.py` measures MemoryQuery native execution, fixed-layout adapters, and layout conversions. The `--fusion` option selects a single mode per run (`off` by default). Outputs include `report.json` and `report.csv` with latency percentiles, throughput, peak GPU memory, and system metadata. The `--baseline-json` option is for the historical legacy-versus-stream-major comparison against commit `322bcc6`.
 
 ```bash
-python benchmarks/profile_memory_query.py \
-  --implementation native --layout fixed --depth 4 \
-  --output benchmark-results/native-fixed
-
-python benchmarks/profile_memory_query.py \
-  --implementation wrapper --layout fixed --depth 4 --mode train \
-  --output benchmark-results/wrapper-train
-
-python benchmarks/profile_memory_query.py \
-  --layout packed --batch-size 3 \
-  --memory-lengths 7,31,127 --query-lengths 3,4,5 \
-  --output benchmark-results/packed
+python -m benchmarks.profile_memory_query --implementation native --fusion off --layout fixed --mode train --output benchmark-results/mq-off
+python -m benchmarks.profile_memory_query --implementation native --fusion residual_fwd_bwd --layout fixed --mode train --output benchmark-results/mq-fused
 ```
 
-Native fixed-layout measurements separate the flat core from adapter-inclusive
-execution. Each output directory contains `report.json` and `report.csv`.
-
-To create PNG charts from a report, install the optional plotting dependency
-(`python -m pip install ".[viz]"`) and run:
+To generate plots, install the optional visualization dependencies and run:
 
 ```bash
-python benchmarks/visualize_memory_query.py benchmark-results/native-fixed/report.json
+python -m pip install ".[viz]"
+python -m benchmarks.visualize_memory_query benchmark-results/mq-off/report.json
 ```
 
-The visualizer plots latency with p10/p90 ranges, throughput, and peak allocated
-GPU memory. Reports with baseline comparisons also produce speedup and absolute
-latency-comparison charts. Images are saved next to the report unless `--output`
-specifies another directory.
-
-For before/after measurements, the driver supports `--implementation legacy`
-with `--source-root` pointing to a separate checkout at its recorded baseline
-commit, and `--baseline-json` when measuring the revised implementation.
-Comparisons require compatible hardware, software, and workload configurations.
-Use `--help` for all options or `--trace PATH` for an optional Chrome trace.
-The generated data and traces are not committed or used as CI test thresholds.
+The visualizer produces latency, throughput, and GPU memory charts.
 
 ## AI use
 
