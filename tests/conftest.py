@@ -126,6 +126,12 @@ def pytest_sessionstart(session):
 
 
 def pytest_collection_modifyitems(config, items):
+    if config.getoption("--require-fusion") and not any(
+        item.get_closest_marker("fusion") for item in items
+    ):
+        raise pytest.UsageError(
+            "--require-fusion collected no fusion-marked tests; refusing an empty validation"
+        )
     cuda_items = [item for item in items if item.get_closest_marker("cuda")]
     if cuda_items:
         reason = cuda_unavailable_reason()
