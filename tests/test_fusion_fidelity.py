@@ -10,15 +10,17 @@ from varlen_transformer import _fusion
 from varlen_transformer.block import _layernorm_fwd_fp32
 
 
-@pytest.mark.parametrize("width,rows", [(128, 16385), (2048, 4097)])
-def test_backward_group_bound_preserves_native_fallback(monkeypatch, width, rows):
-    monkeypatch.setattr(_fusion, "_load", lambda: pytest.fail("Oversized reduction must fall back"))
+@pytest.mark.parametrize("width", [64,128,256,512,1024,2048,4096])
+def test_backward_group_bound_preserves_native_fallback(monkeypatch,width):
+    rows = 1024*min(256,16384//width)+1
+    monkeypatch.setattr(_fusion,"_load",lambda: pytest.fail("Oversized reduction must fall back"))
     from torch._subclasses.fake_tensor import FakeTensorMode
     with FakeTensorMode():
-        x = torch.empty(rows, width, device="cuda", dtype=torch.bfloat16)
-        stat = torch.empty(rows, 1, device="cuda")
-        w = torch.empty(width, device="cuda")
-        assert _fusion.layernorm_backward(x, x, stat, stat, w, w, fusion="ln_bwd") is None
+        x = torch.empty(rows,width,device="cuda",dtype=torch.bfloat16)
+        stat = torch.empty(rows,1,device="cuda")
+        w = torch.empty(width,device="cuda")
+        assert _fusion.layernorm_backward(x,x,stat,stat,w,w,fusion="ln_bwd") is None
+
 
 
 @pytest.mark.parametrize("version", ["2.8.0", "2.9.2", "2.10.0.dev20261010+cu130"])
@@ -157,3 +159,25 @@ def test_backward_uses_original_gradient_gate(fusion_calls,width):
     for a,z in zip(actual,expected):
         torch.testing.assert_close(a,z,rtol=2e-4,atol=5e-5)
         assert float((a-z).norm()/z.norm().clamp_min(1e-12))<1e-4
+
+
+@pytest.mark.cuda
+@pytest.mark.fusion
+@pytest.mark.parametrize("width,rows,row_tile", [(64,262144,256),(128,131072,128),(256,65536,64)])
+def test_backward_maximum_groups_match_native(fusion_calls,width,rows,row_tile):
+    from varlen_transformer.block import _layernorm_bwd_fp32
+    assert rows == 1024*row_tile
+    torch.manual_seed(41)
+    x = torch.randn(rows,width,device="cuda").bfloat16()
+    grad = torch.randn_like(x)
+    w = torch.randn(width,device="cuda")
+    b = torch.randn_like(w)
+    _,m,r = torch.ops.aten.native_layer_norm.default(x.float(),[width],w,b,1e-5)
+    expected = torch.ops.aten.native_layer_norm_backward.default(
+        grad.float(),x.float(),[width],m,r,w,b,[True,True,True])
+    actual = _layernorm_bwd_fp32(grad,x,m,r,w,b,fusion="ln_bwd")
+    assert fusion_calls["ln_backward"] == 1
+    for a,z in zip(actual,expected):
+        assert a.dtype == torch.float32
+        torch.testing.assert_close(a,z,rtol=2e-4,atol=5e-5)
+        assert float((a-z).norm()/z.norm().clamp_min(1e-12)) < 1e-4

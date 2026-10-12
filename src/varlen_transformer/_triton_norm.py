@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
+NUM_WARPS = 8
 
 @triton.jit
 def _combine(mean_b, m2_b, count_b, mean_a, m2_a, count_a):
@@ -114,7 +115,7 @@ def forward(x, weight, bias, eps):
     y, mean, rstd = _outputs(x, rows)
     _forward[(rows,)](x, x, weight, bias, y, y, mean, rstd,
                      e, triton.next_power_of_2(e), eps, False, 0, 0, rows,
-                     num_warps=4 if e <= 1024 else 8, enable_fp_fusion=False)
+                     num_warps=NUM_WARPS, enable_fp_fusion=False)
     return y, mean, rstd
 
 
@@ -126,7 +127,7 @@ def residual_forward(residual, branch, weight, bias, eps, start, norm_rows):
     _forward[(rows,)](residual, branch, weight, bias, y, out, mean, rstd,
                      e, triton.next_power_of_2(e), eps, True, start,
                      branch.numel() // e, norm_rows,
-                     num_warps=4 if e <= 1024 else 8, enable_fp_fusion=False)
+                     num_warps=NUM_WARPS, enable_fp_fusion=False)
     return out, y, mean, rstd
 
 
@@ -167,7 +168,7 @@ def _backward_reduce(PW, PB, GW, GB, E: tl.constexpr, GROUPS: tl.constexpr,
 
 def backward(grad, x, mean, rstd, weight):
     n, e = x.numel() // x.shape[-1], x.shape[-1]
-    row_tile = 16 if e <= 1024 else 4
+    row_tile = min(256,16384 // triton.next_power_of_2(e))
     groups = triton.cdiv(n, row_tile)
     # Avoid an unbounded second reduction and fall back for very large token counts.
     if groups > 1024:
@@ -179,8 +180,8 @@ def backward(grad, x, mean, rstd, weight):
     partial_b = torch.empty_like(partial_w)
     _backward_partials[(groups,)](grad, x, mean, rstd, weight, gx, partial_w, partial_b,
                                  n, e, triton.next_power_of_2(e), row_tile,
-                                 num_warps=4 if e <= 512 else 8, enable_fp_fusion=False)
+                                 num_warps=NUM_WARPS, enable_fp_fusion=False)
     _backward_reduce[(triton.cdiv(e, 16),)](
         partial_w, partial_b, gw, gb, e, groups, triton.next_power_of_2(groups), 16,
-        num_warps=4, enable_fp_fusion=False)
+        num_warps=NUM_WARPS, enable_fp_fusion=False)
     return gx, gw, gb

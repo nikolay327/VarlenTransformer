@@ -200,7 +200,11 @@ Fusion is configured independently for each block. The selected mode is captured
 | `ln_fwd_bwd` | Fused Welford LayerNorm | Fused FP32 LayerNorm gradients |
 | `residual_fwd_bwd` | Fused residual + Welford LayerNorm | Fused FP32 LayerNorm gradients |
 
-Forward fusion uses a vectorized Welford reduction and FP32 affine arithmetic. The Triton forward kernels support contiguous BF16 inputs with embedding widths divisible by four, from 32 to 4096. Unsupported shapes, layouts, and parameter alignments use the ATen implementation. Backward fusion uses tiled gradient computation followed by a bounded FP32 affine-gradient reduction, with ATen handling unsupported reductions.
+Forward fusion uses a vectorized Welford reduction and FP32 affine arithmetic. The Triton forward kernels support contiguous BF16 inputs with embedding widths divisible by four, from 32 to 4096. Unsupported shapes, layouts, and parameter alignments use the ATen implementation.
+
+Backward fusion computes FP32 input and affine gradients using a tiled partial-gradient kernel followed by a bounded reduction. The backward kernel uses four warps and selects `R = min(256, 16384 // next_power_of_2(E))` rows per program, where `E` is the embedding width. The tile size is limited to 16,384 elements, and the final reduction supports at most 1,024 partial groups. Therefore, backward fusion requires `ceil(N / R) <= 1024`, where `N` is the number of flattened token rows.
+
+For example, the maximum supported token counts are 262,144 for `E=64`, 131,072 for `E=128`, 65,536 for `E=256`, 32,768 for `E=512`, and 8,192 for `E=2048`. These are implementation-specific backward-fusion limits, not independent batch-size or sequence-length restrictions. Larger workloads fall back to the native ATen backward implementation, while supported forward fusion can still execute.
 
 Residual sums are rounded to BF16 before normalization. MemoryQuery's partial-residual specialization applies to flat stream-major tensors; batched partial updates use the ATen implementation. Dropout, FlashAttention, linear projections, and the existing first-order autograd interfaces are unchanged.
 

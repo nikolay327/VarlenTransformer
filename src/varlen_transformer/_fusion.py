@@ -21,7 +21,7 @@ def validate_mode(fusion: str) -> str:
 
 
 def _backward_rows(width):
-    return 16 if width <= 1024 else 4
+    return min(256,16384 // (1 << (width-1).bit_length()))
 
 
 def _forward_supported(x, weight, bias):
